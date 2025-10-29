@@ -1,0 +1,19 @@
+numpy
+pandas
+matplotlib
+seaborn
+
+# Bioinformatics and UniProt access
+biopython
+bioservices
+pybiomart
+
+# Web requests and URL handling
+requests
+
+# Excel and CSV export
+XlsxWriter
+
+# Streamlit app framework
+streamlit
+
