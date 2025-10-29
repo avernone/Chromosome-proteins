@@ -41,7 +41,7 @@ if chromosome_number:
             )
 
             # Clean Ensembl data
-            Ensembl_data['UniProtKB/Swiss-Prot ID'].replace('', np.NaN, inplace=True)
+            Ensembl_data['UniProtKB/Swiss-Prot ID'].replace('', np.nan, inplace=True)
             Ensembl_data = Ensembl_data.dropna()
             Ensembl_data['Peptide'] = Ensembl_data['Peptide'].str.rstrip('*')
             Ensembl_data['length'] = Ensembl_data['Peptide'].apply(len)
