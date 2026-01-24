@@ -3,167 +3,173 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from bioservices import UniProt
-from Bio.SeqUtils.ProtParam import ProteinAnalysis
-from pybiomart import Server, Dataset
+import requests
 import io
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
+from scipy.stats import pearsonr
 
-# --- Streamlit setup ---
-st.set_page_config(page_title="Chromosome Amino Acid & E/Q Analysis", page_icon="🧬", layout="wide")
-st.title("🧬 Chromosome Amino Acid Composition and E/Q Ratio Explorer")
+# Streamlit setup
+st.set_page_config(page_title="Chromosome E/Q Ratio Explorer", page_icon="🧬", layout="wide")
+st.title("🧬 Chromosome Amino Acid Composition and E/Q Ratio Explorer (Enhanced Version)")
 
 st.write("""
-Enter a **human chromosome number (1–22, X, or Y)** to retrieve all protein-coding genes.  
-The app will:
-1. Retrieve protein sequences from Ensembl and UniProt  
-2. Compute amino acid composition for each gene  
-3. Calculate the **E/Q ratio** (glutamate/glutamine)  
-4. Display summary tables and visualizations  
-5. Export results and plots to Excel
+Enter a **human chromosome number (1–22, X, or Y)** to analyze all reviewed UniProt entries for that chromosome.
+
+The app:
+1. Retrieves all **reviewed (Swiss-Prot)** human proteins for the selected chromosome  
+2. Computes amino acid composition for each sequence  
+3. Calculates the **E/Q ratio (glutamate/glutamine)**  
+4. Displays summary tables including genomic coordinates and amino acid counts  
+5. Evaluates **correlation between protein length and E/Q ratio**  
+6. Exports results, statistics and plots in Excel format
 """)
 
 # --- Input ---
-chromosome_number = st.text_input("Chromosome number:", "")
+chromosome = st.text_input("Chromosome number (1–22, X, Y):", "").strip()
 
-if chromosome_number:
-    with st.spinner("Retrieving and analyzing protein data..."):
+# --- Cache API calls for speed ---
+@st.cache_data(show_spinner=False)
+def fetch_uniprot_data(chrom):
+    """Fetch UniProt reviewed human proteins by chromosome."""
+    base_url = "https://rest.uniprot.org/uniprotkb/search"
+    query = f'(proteomecomponent:"chromosome {chrom}") AND (organism_id:9606) AND (reviewed:true)'
+    params = {"query": query, "format": "tsv", "fields": "accession,id,length,sequence,ft_gene,ft_gene_start,ft_gene_end"}
+    r = requests.get(base_url, params=params, timeout=60)
+    if r.status_code == 200 and len(r.text.splitlines()) > 1:
+        return pd.read_csv(io.StringIO(r.text), sep="\t")
+    else:
+        return pd.DataFrame()
+
+# --- Compute amino acid composition & E/Q ratio ---
+def compute_composition(df):
+    compositions, eq_ratios = [], []
+    for seq in df["Sequence"]:
         try:
-            # --- Step 1. Retrieve data from Ensembl ---
-            server = Server(host='http://www.ensembl.org')
-            dataset = Dataset(name='hsapiens_gene_ensembl', host='http://www.ensembl.org')
+            analysis = ProteinAnalysis(seq)
+            counts = analysis.count_amino_acids()
+            e = counts.get("E", 0)
+            q = counts.get("Q", 0)
+            eq = e / q if q != 0 else np.nan
+        except Exception:
+            counts = {aa: np.nan for aa in list("ACDEFGHIKLMNPQRSTVWY")}
+            eq = np.nan
+        compositions.append(counts)
+        eq_ratios.append(eq)
+    comp_df = pd.DataFrame(compositions)
+    df["E/Q ratio"] = eq_ratios
+    return pd.concat([df, comp_df], axis=1)
 
-            Ensembl_data = dataset.query(
-                attributes=[
-                    'ensembl_gene_id', 'external_gene_name', 'start_position', 'end_position',
-                    'chromosome_name', 'uniprotswissprot', 'peptide'
-                ],
-                filters={'chromosome_name': [chromosome_number]}
-            )
+# --- Run analysis ---
+if chromosome:
+    with st.spinner(f"Retrieving reviewed UniProt proteins for chromosome {chromosome}..."):
+        df = fetch_uniprot_data(chromosome)
 
-            # Clean Ensembl data
-            Ensembl_data['UniProtKB/Swiss-Prot ID'].replace('', np.nan, inplace=True)
-            Ensembl_data = Ensembl_data.dropna()
-            Ensembl_data['Peptide'] = Ensembl_data['Peptide'].str.rstrip('*')
-            Ensembl_data['length'] = Ensembl_data['Peptide'].apply(len)
-            Ensembl_data.rename(columns={
-                'UniProtKB/Swiss-Prot ID': 'id',
-                'Peptide': 'sequence'
-            }, inplace=True)
+        if df.empty:
+            st.error("❌ No reviewed UniProt entries found for this chromosome.")
+        else:
+            total_proteins = len(df)
+            st.success(f"✅ Retrieved {total_proteins} protein entries.")
 
-            # --- Step 2. Retrieve UniProt data for the same chromosome ---
-            service = UniProt()
-            query = f'proteomecomponent:"chromosome {chromosome_number}" AND organism_id:9606 AND proteome:up000005640 AND reviewed:true'
-            cols = "accession,id,length,sequence"
-            result_uniprot = service.search(query, frmt="tsv", columns=cols)
+            # Compute amino acid composition and E/Q ratio
+            df_full = compute_composition(df)
+            df_full.dropna(subset=["E/Q ratio"], inplace=True)
+            analyzed_proteins = len(df_full)
 
-            df_uniprot = pd.read_table(io.StringIO(result_uniprot))
-            df_uniprot.columns = ['id', 'entry name', 'length', 'sequence']
+            st.caption(f"⚙️ Total retrieved proteins: {total_proteins} — proteins with valid E/Q ratio: {analyzed_proteins}")
 
-            # --- Step 3. Merge Ensembl + UniProt ---
-            merged = pd.merge(Ensembl_data, df_uniprot, on=['id', 'length', 'sequence'], how='inner')
+            # Sort by E/Q ratio
+            df_full.sort_values(by="E/Q ratio", inplace=True)
 
-            # --- Step 4. Compute amino acid counts + E/Q ratios ---
-            aa_counts = []
-            eq_ratios = []
+            # --- Summary table ---
+            st.subheader(f"📊 Proteins and E/Q ratios (Chromosome {chromosome})")
+            st.dataframe(df_full[
+                [
+                    "Gene Start", "Gene End", "Entry", "Entry Name", "Length", "E/Q ratio"
+                ] + list("ACDEFGHIKLMNPQRSTVWY")
+            ])
 
-            for seq in merged['sequence']:
-                try:
-                    analysis = ProteinAnalysis(seq)
-                    counts = analysis.count_amino_acids()
-                    aa_counts.append(counts)
-                    e = counts.get("E", 0)
-                    q = counts.get("Q", 0)
-                    eq_ratios.append(e / q if q != 0 else np.nan)
-                except Exception:
-                    aa_counts.append({aa: np.nan for aa in list("ACDEFGHIKLMNPQRSTVWY")})
-                    eq_ratios.append(np.nan)
+            # --- Average amino acid composition ---
+            st.subheader(f"📈 Average amino acid composition")
+            avg_comp = df_full[list("ACDEFGHIKLMNPQRSTVWY")].mean()
+            st.bar_chart(avg_comp)
 
-            df_counts = pd.DataFrame(aa_counts)
-            merged["E/Q ratio"] = eq_ratios
+            # --- Summary statistics of E/Q ratio ---
+            st.subheader("📋 E/Q ratio summary statistics")
 
-            # --- Step 5. Combine and sort ---
-            df_full = pd.concat([merged, df_counts], axis=1)
-            df_full = df_full.sort_values(by=["Gene start (bp)"])
+            eq_summary = {
+                "Mean": df_full["E/Q ratio"].mean(),
+                "Median": df_full["E/Q ratio"].median(),
+                "Standard deviation": df_full["E/Q ratio"].std(),
+                "Minimum": df_full["E/Q ratio"].min(),
+                "Maximum": df_full["E/Q ratio"].max(),
+                "Count": analyzed_proteins
+            }
+            eq_summary_df = pd.DataFrame(eq_summary, index=["Value"]).T
+            st.table(eq_summary_df)
 
-            st.subheader("Per-protein amino acid counts and E/Q ratios")
-            st.dataframe(df_full)
+            # --- Correlation analysis: E/Q ratio vs Length ---
+            st.subheader("🔗 Correlation between protein length and E/Q ratio")
+            corr_df = df_full.dropna(subset=["Length", "E/Q ratio"])
+            if len(corr_df) > 2:
+                r, p = pearsonr(corr_df["Length"], corr_df["E/Q ratio"])
+                st.write(f"**Pearson correlation (r)** = `{r:.3f}` (p = {p:.3e})")
 
-            # --- Step 6. Average amino acid composition ---
-            st.subheader(f"Average amino acid composition (Chromosome {chromosome_number})")
-            avg_composition = df_counts.mean().sort_index()
-            st.bar_chart(avg_composition)
-
-            # --- Step 7. Sort by E/Q ratio and add progressive numbering ---
-            eq_sorted = df_full.sort_values(by="E/Q ratio", ascending=True).dropna(subset=["E/Q ratio"])
-            eq_sorted.insert(0, "No.", range(1, len(eq_sorted) + 1))
-
-            st.subheader(f"Proteins sorted by E/Q ratio (Chromosome {chromosome_number})")
-            st.dataframe(eq_sorted[["No.", "Gene name", "entry name", "E/Q ratio"]])
-
-            # --- Step 8. Highlight key proteins (lowest, median, highest) ---
-            min_row = eq_sorted.iloc[0]
-            median_row = eq_sorted.iloc[len(eq_sorted)//2]
-            max_row = eq_sorted.iloc[-1]
-
-            # --- Step 9. Bar plot E/Q ratio ---
-            fig, ax = plt.subplots(figsize=(12, 5))
-            colors = sns.color_palette("coolwarm", len(eq_sorted))
-            ax.bar(eq_sorted["No."], eq_sorted["E/Q ratio"], color=colors)
-
-            for idx, row in [
-                (0, min_row),
-                (len(eq_sorted)//2, median_row),
-                (len(eq_sorted)-1, max_row)
-            ]:
-                ax.text(
-                    idx + 1,
-                    row["E/Q ratio"] + 0.02,
-                    f"{row['entry name']} ({row['E/Q ratio']:.2f})",
-                    ha="center",
-                    va="bottom",
-                    fontsize=8,
-                    rotation=45,
-                    weight="bold",
-                    color="black"
+                # Scatter plot with regression line
+                fig_corr, ax_corr = plt.subplots(figsize=(8, 5))
+                sns.regplot(
+                    data=corr_df,
+                    x="Length",
+                    y="E/Q ratio",
+                    scatter_kws={"alpha": 0.6, "color": "skyblue"},
+                    line_kws={"color": "red"}
                 )
+                ax_corr.set_title(f"Correlation between protein length and E/Q ratio (r = {r:.2f})")
+                st.pyplot(fig_corr)
+            else:
+                st.warning("Not enough data points to compute correlation.")
 
-            plt.ylabel("E/Q ratio (E / Q)")
-            plt.xlabel("Protein index (No.)")
-            plt.title(f"E/Q ratio distribution across Chromosome {chromosome_number}")
-            plt.tight_layout()
+            # --- Plot distribution of E/Q ratios ---
+            fig, ax = plt.subplots(figsize=(10, 5))
+            sns.histplot(df_full["E/Q ratio"], bins=30, kde=True, color="skyblue", ax=ax)
+            ax.set_title(f"E/Q ratio distribution (Chromosome {chromosome})")
+            ax.set_xlabel("E/Q ratio")
+            ax.set_ylabel("Protein count")
             st.pyplot(fig)
 
-            # --- Step 10. Summary info box ---
-            st.info(f"""
-**Summary for Chromosome {chromosome_number}:**
-- Lowest E/Q: `{min_row['entry name']}` ({min_row['E/Q ratio']:.2f})
-- Median E/Q: `{median_row['entry name']}` ({median_row['E/Q ratio']:.2f})
-- Highest E/Q: `{max_row['entry name']}` ({max_row['E/Q ratio']:.2f})
-""")
-
-            # --- Step 11. Export Excel with plots ---
+            # --- Export Excel ---
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
                 df_full.to_excel(writer, index=False, sheet_name="ChromosomeData")
-                eq_sorted.to_excel(writer, index=False, sheet_name="EQ_Sorted")
+                avg_comp.to_excel(writer, sheet_name="AverageComposition")
+                eq_summary_df.to_excel(writer, sheet_name="EQ_Summary")
 
-                # Save plot to Excel
-                figfile = io.BytesIO()
-                fig.savefig(figfile, format="png", bbox_inches="tight")
-                figfile.seek(0)
-                worksheet = writer.sheets["EQ_Sorted"]
-                worksheet.insert_image("E2", "eq_plot.png", {"image_data": figfile})
+                if len(corr_df) > 2:
+                    corr_summary = pd.DataFrame({
+                        "Statistic": ["Pearson r", "p-value"],
+                        "Value": [r, p]
+                    })
+                    corr_summary.to_excel(writer, sheet_name="Correlation", index=False)
 
-            excel_data = output.getvalue()
+                # Insert plots
+                fig_buf = io.BytesIO()
+                fig.savefig(fig_buf, format="png", bbox_inches="tight")
+                fig_buf.seek(0)
+                if len(corr_df) > 2:
+                    corr_buf = io.BytesIO()
+                    fig_corr.savefig(corr_buf, format="png", bbox_inches="tight")
+                    corr_buf.seek(0)
+
+                worksheet = writer.sheets["ChromosomeData"]
+                worksheet.insert_image("I2", "eq_distribution.png", {"image_data": fig_buf})
+                if len(corr_df) > 2:
+                    writer.sheets["Correlation"].insert_image("D5", "correlation.png", {"image_data": corr_buf})
+
             st.download_button(
-                label="⬇️ Download Excel (with E/Q plot)",
-                data=excel_data,
-                file_name=f"chromosome_{chromosome_number}_AA_EQ_analysis.xlsx",
+                label="⬇️ Download Excel (Results + Statistics + Correlation)",
+                data=output.getvalue(),
+                file_name=f"chromosome_{chromosome}_EQ_summary.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
 
             st.success("✅ Analysis completed successfully.")
-
-        except Exception as e:
-            st.error(f"❌ Error retrieving or processing data: {e}")
 
