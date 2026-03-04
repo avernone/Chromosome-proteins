@@ -6,5 +6,6 @@ seaborn
 biopython
 requests
 xlsxwriter
+pybiomart
 scipy
 
