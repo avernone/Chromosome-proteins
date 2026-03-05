@@ -7,6 +7,7 @@ import seaborn as sns
 from Bio.SeqUtils.ProtParam import ProteinAnalysis
 from scipy.stats import pearsonr
 from pybiomart import Dataset
+from typing import Optional
 
 # =========================================================
 # Streamlit setup
@@ -22,21 +23,25 @@ st.title("🧬 Chromosome Amino Acid Composition and E/Q Ratio Explorer (Streaml
 st.write("""
 Enter a **human chromosome (1–22, X, Y)**.
 
-Workflow:
-1) Show **all** proteins found (Swiss-Prot mapping + peptide)  
-2) Compute **E/Q ratio** and mark proteins where E/Q is **not usable** (typically **Q = 0**)  
-3) Compute **average amino acid composition** using **all** proteins found  
-4) Compute **E/Q summary statistics** using **only proteins with valid E/Q**  
-5) Correlation + distribution on valid E/Q proteins  
-6) **Walking (Surfing) analysis** on the chromosome-ordered protein list (AA selected + E + Q only) + quick chromosome-wide plot
+Button-driven workflow (to avoid long automatic reruns on large chromosomes):
+1) Generate the **full protein table** (Ensembl + Swiss-Prot mapping + peptide)
+2) Generate the **E/Q analysis** (compute AA counts + E/Q, statistics, plots)
+3) Generate the **Walking (Surfing) analysis** (AA selected + E + Q only) + quick chromosome-wide plot
 """)
 
 chromosome = st.text_input("Chromosome (1–22, X, Y):", "").strip()
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
 
+# =========================================================
+# Session state init
+# =========================================================
+for k in ["chrom_ok", "ensembl_df", "df_all", "df_valid", "eq_summary_df", "avg_comp_all", "walk_df", "fig_corr", "fig_hist", "fig_walk"]:
+    if k not in st.session_state:
+        st.session_state[k] = None
+
 
 # =========================================================
-# Data fetch (Ensembl / BioMart)
+# Data fetch (Ensembl / BioMart)  -- keep the "old" code (http)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def fetch_ensembl_chromosome_data(chrom: str) -> pd.DataFrame:
@@ -88,34 +93,49 @@ def fetch_ensembl_chromosome_data(chrom: str) -> pd.DataFrame:
 
 
 # =========================================================
-# Core analysis: AA counts + E/Q validity
+# Core analysis: AA counts + E/Q validity (batch + progress)
 # =========================================================
-def add_aa_counts_and_eq(df: pd.DataFrame) -> pd.DataFrame:
-    aa_counts_list = []
-    eq_list = []
-    eq_valid_list = []
-    length_list = []
+def add_aa_counts_and_eq(df: pd.DataFrame, batch_size: int = 200) -> pd.DataFrame:
+    """
+    Compute AA counts (20 AA), Length, E/Q ratio and E/Q valid.
+    Uses batch processing + progress to reduce "stuck" feeling.
+    """
+    n = len(df)
+    progress = st.progress(0)
+    status = st.empty()
 
-    for seq in df["Sequence"].astype(str):
-        seq = seq.rstrip("*")
-        analysis = ProteinAnalysis(seq)
-        counts = analysis.count_amino_acids()
+    aa_rows = []
+    for start in range(0, n, batch_size):
+        end = min(start + batch_size, n)
+        batch = df.iloc[start:end]
 
-        e = counts.get("E", 0)
-        q = counts.get("Q", 0)
-        eq = e / q if q != 0 else np.nan
-        eq_valid = (q != 0)
+        batch_rows = []
+        for seq in batch["Sequence"].astype(str):
+            seq = seq.rstrip("*")
+            analysis = ProteinAnalysis(seq)
+            counts = analysis.count_amino_acids()
 
-        aa_counts_list.append({aa: int(counts.get(aa, 0)) for aa in AA_ORDER})
-        eq_list.append(eq)
-        eq_valid_list.append(eq_valid)
-        length_list.append(len(seq))
+            e = counts.get("E", 0)
+            q = counts.get("Q", 0)
+            eq = e / q if q != 0 else np.nan
+            eq_valid = (q != 0)
 
-    aa_df = pd.DataFrame(aa_counts_list)
+            row = {aa: int(counts.get(aa, 0)) for aa in AA_ORDER}
+            row["Length"] = len(seq)
+            row["E/Q ratio"] = eq
+            row["E/Q valid"] = eq_valid
+
+            batch_rows.append(row)
+
+        aa_rows.append(pd.DataFrame(batch_rows))
+        progress.progress(end / n)
+        status.write(f"Computed {end}/{n} proteins...")
+
+    progress.empty()
+    status.empty()
+
+    aa_df = pd.concat(aa_rows, ignore_index=True)
     out = pd.concat([df.reset_index(drop=True), aa_df], axis=1)
-    out["Length"] = length_list
-    out["E/Q ratio"] = eq_list
-    out["E/Q valid"] = eq_valid_list
     return out
 
 
@@ -159,7 +179,7 @@ def make_walk_table(
         surfing_e = int(np.sum(frame_e > threshold))
         surfing_q = int(np.sum(frame_q > threshold))
 
-        # Frame start/end bp (current definition: start positions of first and last protein in the frame)
+        # Definition: start positions of first and last protein in the frame
         frame_start_bp = float(frame_pos[0]) if len(frame_pos) else np.nan
         frame_end_bp = float(frame_pos[-1]) if len(frame_pos) else np.nan
 
@@ -188,7 +208,7 @@ def to_excel_bytes(
     df_valid: pd.DataFrame,
     avg_comp_all: pd.Series,
     eq_summary_df: pd.DataFrame,
-    walk_df: pd.DataFrame | None = None,
+    walk_df: Optional[pd.DataFrame] = None,
     fig_hist=None,
     fig_corr=None,
     fig_walk=None,
@@ -218,13 +238,10 @@ def to_excel_bytes(
             sheet.insert_image("D22", "corr.png", {"image_data": imgdata2})
 
         if fig_walk is not None and walk_df is not None and not walk_df.empty:
-            # Put walk plot into Walking sheet if exists, else create it
-            if "Walking" in writer.sheets:
-                sheetw = writer.sheets["Walking"]
-            else:
+            sheetw = writer.sheets.get("Walking")
+            if sheetw is None:
                 sheetw = writer.book.add_worksheet("Walking")
                 writer.sheets["Walking"] = sheetw
-
             imgdata3 = io.BytesIO()
             fig_walk.savefig(imgdata3, format="png", bbox_inches="tight")
             imgdata3.seek(0)
@@ -234,12 +251,20 @@ def to_excel_bytes(
 
 
 # =========================================================
-# Run
+# STEP 1: Fetch Ensembl + show full raw table
 # =========================================================
-if chromosome:
+st.subheader("Step 1 — Full protein table (raw Ensembl + Swiss-Prot mapping)")
+run_step1 = st.button("1) Generate full protein table")
+
+if run_step1:
+    if not chromosome:
+        st.error("Please enter a chromosome first.")
+        st.stop()
+
     chrom_ok = chromosome.upper()
     if chrom_ok not in ["X", "Y"]:
         chrom_ok = chromosome
+    st.session_state["chrom_ok"] = chrom_ok
 
     with st.spinner(f"Fetching Ensembl data for chromosome {chrom_ok}..."):
         try:
@@ -252,162 +277,191 @@ if chromosome:
         st.error("❌ No Ensembl rows found for this chromosome (or no Swiss-Prot mapping / peptide available).")
         st.stop()
 
+    st.session_state["ensembl_df"] = ensembl_df
+
+    # Reset downstream results if chromosome changes
+    st.session_state["df_all"] = None
+    st.session_state["df_valid"] = None
+    st.session_state["walk_df"] = None
+    st.session_state["fig_corr"] = None
+    st.session_state["fig_hist"] = None
+    st.session_state["fig_walk"] = None
+    st.session_state["eq_summary_df"] = None
+    st.session_state["avg_comp_all"] = None
+
     st.success(f"✅ Found {len(ensembl_df)} rows (gene/protein) with Swiss-Prot mapping + peptide on chromosome {chrom_ok}.")
 
-    with st.spinner("Computing amino acid counts + E/Q ratio..."):
-        df_all = add_aa_counts_and_eq(ensembl_df)
+if st.session_state["ensembl_df"] is not None:
+    ensembl_df = st.session_state["ensembl_df"]
+    cols_step1 = ["Gene stable ID", "Gene name", "Gene start (bp)", "Gene end (bp)", "Entry", "Sequence"]
+    cols_step1 = [c for c in cols_step1 if c in ensembl_df.columns and c != "Chromosome/scaffold name"]
+    st.dataframe(ensembl_df[cols_step1])
 
-    # ---------------------------------------------------------
-    # Table 1: ALL proteins (no Chromosome/scaffold column)
-    # ---------------------------------------------------------
-    st.subheader("📊 Full table (all proteins found)")
-    cols_all = [
-        "Gene stable ID",
-        "Gene name",
-        "Gene start (bp)",
-        "Gene end (bp)",
-        "Entry",
-        "Length",
-        "E/Q ratio",
-        "E/Q valid",
-    ] + AA_ORDER
-    cols_all = [c for c in cols_all if c in df_all.columns and c != "Chromosome/scaffold name"]
-    st.dataframe(df_all[cols_all])
 
-    # ---------------------------------------------------------
-    # E/Q usability report
-    # ---------------------------------------------------------
-    invalid_mask = ~df_all["E/Q valid"]
-    n_invalid = int(invalid_mask.sum())
-    n_total = int(len(df_all))
-    n_valid = n_total - n_invalid
+# =========================================================
+# STEP 2: Compute AA counts + E/Q analysis and plots
+# =========================================================
+if st.session_state["ensembl_df"] is not None:
+    st.subheader("Step 2 — E/Q analysis (compute AA counts + statistics)")
+    run_step2 = st.button("2) Generate E/Q analysis")
 
-    st.subheader("✅/❌ E/Q usability")
-    st.write(f"Total proteins found: **{n_total}**")
-    st.write(f"Proteins with **non-usable** E/Q (Q = 0): **{n_invalid}**")
-    st.write(f"Proteins with **valid** E/Q: **{n_valid}**")
+    if run_step2:
+        ensembl_df = st.session_state["ensembl_df"]
+        chrom_ok = st.session_state["chrom_ok"]
 
-    if n_invalid > 0:
-        with st.expander("Show rows with non-usable E/Q"):
-            show_bad_cols = [c for c in ["Gene stable ID", "Gene name", "Entry", "Length", "E", "Q", "E/Q ratio"] if c in df_all.columns]
-            st.dataframe(df_all.loc[invalid_mask, show_bad_cols])
+        with st.spinner("Computing amino acid counts + E/Q ratio..."):
+            df_all = add_aa_counts_and_eq(ensembl_df, batch_size=200)
 
-    # ---------------------------------------------------------
-    # Average AA composition on ALL proteins
-    # ---------------------------------------------------------
-    st.subheader("📈 Average amino acid composition (all proteins)")
-    avg_comp_all = df_all[AA_ORDER].mean(numeric_only=True)
-    st.bar_chart(avg_comp_all)
+        st.session_state["df_all"] = df_all
 
-    # ---------------------------------------------------------
-    # E/Q summary on VALID proteins only
-    # ---------------------------------------------------------
-    st.subheader("📋 E/Q ratio summary statistics (valid E/Q only)")
-    df_valid = df_all[df_all["E/Q valid"]].copy().reset_index(drop=True)
+        # Full table with AA counts + E/Q
+        st.subheader("📊 Full table with AA counts + E/Q")
+        cols_all = [
+            "Gene stable ID",
+            "Gene name",
+            "Gene start (bp)",
+            "Gene end (bp)",
+            "Entry",
+            "Length",
+            "E/Q ratio",
+            "E/Q valid",
+        ] + AA_ORDER
+        cols_all = [c for c in cols_all if c in df_all.columns and c != "Chromosome/scaffold name"]
+        st.dataframe(df_all[cols_all])
 
-    if df_valid.empty:
-        st.error("No proteins with valid E/Q on this chromosome.")
-        st.stop()
+        # E/Q usability report
+        invalid_mask = ~df_all["E/Q valid"]
+        n_invalid = int(invalid_mask.sum())
+        n_total = int(len(df_all))
+        n_valid = n_total - n_invalid
 
-    eq_summary = {
-        "Mean": df_valid["E/Q ratio"].mean(),
-        "Median": df_valid["E/Q ratio"].median(),
-        "Standard deviation": df_valid["E/Q ratio"].std(),
-        "Minimum": df_valid["E/Q ratio"].min(),
-        "Maximum": df_valid["E/Q ratio"].max(),
-        "Count (valid EQ)": len(df_valid),
-        "Total proteins": n_total,
-        "Invalid EQ (Q=0)": n_invalid,
-    }
-    eq_summary_df = pd.DataFrame(eq_summary, index=["Value"]).T
-    st.table(eq_summary_df)
+        st.subheader("✅/❌ E/Q usability")
+        st.write(f"Total proteins found: **{n_total}**")
+        st.write(f"Proteins with **non-usable** E/Q (Q = 0): **{n_invalid}**")
+        st.write(f"Proteins with **valid** E/Q: **{n_valid}**")
 
-    # ---------------------------------------------------------
-    # Correlation (valid proteins)
-    # ---------------------------------------------------------
-    st.subheader("🔗 Correlation between protein length and E/Q ratio (valid proteins)")
-    corr_df = df_valid.dropna(subset=["Length", "E/Q ratio"])
-    fig_corr = None
-    if len(corr_df) > 2:
-        r, p = pearsonr(corr_df["Length"], corr_df["E/Q ratio"])
-        st.write(f"**Pearson r** = `{r:.3f}` (p = `{p:.3e}`)")
+        if n_invalid > 0:
+            with st.expander("Show rows with non-usable E/Q"):
+                show_bad_cols = [c for c in ["Gene stable ID", "Gene name", "Entry", "Length", "E", "Q", "E/Q ratio"] if c in df_all.columns]
+                st.dataframe(df_all.loc[invalid_mask, show_bad_cols])
 
-        fig_corr, ax = plt.subplots(figsize=(8, 5))
-        sns.regplot(data=corr_df, x="Length", y="E/Q ratio", scatter_kws={"alpha": 0.6})
-        ax.set_title(f"Length vs E/Q (r={r:.2f})")
-        st.pyplot(fig_corr)
-    else:
-        st.warning("Not enough valid data points to compute correlation.")
+        # Average AA composition on ALL proteins
+        st.subheader("📈 Average amino acid composition (all proteins)")
+        avg_comp_all = df_all[AA_ORDER].mean(numeric_only=True)
+        st.session_state["avg_comp_all"] = avg_comp_all
+        st.bar_chart(avg_comp_all)
 
-    # ---------------------------------------------------------
-    # Histogram (valid proteins)
-    # ---------------------------------------------------------
-    st.subheader("📊 E/Q ratio distribution (valid proteins)")
-    fig_hist, axh = plt.subplots(figsize=(10, 5))
-    sns.histplot(df_valid["E/Q ratio"], bins=30, kde=True, ax=axh)
-    axh.set_title(f"E/Q ratio distribution (Chromosome {chrom_ok})")
-    axh.set_xlabel("E/Q ratio")
-    axh.set_ylabel("Protein count")
-    st.pyplot(fig_hist)
+        # E/Q summary on VALID proteins
+        st.subheader("📋 E/Q ratio summary statistics (valid E/Q only)")
+        df_valid = df_all[df_all["E/Q valid"]].copy().reset_index(drop=True)
+        st.session_state["df_valid"] = df_valid
 
-    # ---------------------------------------------------------
-    # Walking (Surfing) analysis + quick chromosome plot
-    # ---------------------------------------------------------
-    st.subheader("🏄 Walking (Surfing) analysis along chromosome-ordered proteins")
+        if df_valid.empty:
+            st.error("No proteins with valid E/Q on this chromosome.")
+            st.stop()
+
+        eq_summary = {
+            "Mean": df_valid["E/Q ratio"].mean(),
+            "Median": df_valid["E/Q ratio"].median(),
+            "Standard deviation": df_valid["E/Q ratio"].std(),
+            "Minimum": df_valid["E/Q ratio"].min(),
+            "Maximum": df_valid["E/Q ratio"].max(),
+            "Count (valid EQ)": len(df_valid),
+            "Total proteins": n_total,
+            "Invalid EQ (Q=0)": n_invalid,
+        }
+        eq_summary_df = pd.DataFrame(eq_summary, index=["Value"]).T
+        st.session_state["eq_summary_df"] = eq_summary_df
+        st.table(eq_summary_df)
+
+        # Correlation (valid)
+        st.subheader("🔗 Correlation between protein length and E/Q ratio (valid proteins)")
+        corr_df = df_valid.dropna(subset=["Length", "E/Q ratio"])
+        fig_corr = None
+        if len(corr_df) > 2:
+            r, p = pearsonr(corr_df["Length"], corr_df["E/Q ratio"])
+            st.write(f"**Pearson r** = `{r:.3f}` (p = `{p:.3e}`)")
+
+            fig_corr, ax = plt.subplots(figsize=(8, 5))
+            sns.regplot(data=corr_df, x="Length", y="E/Q ratio", scatter_kws={"alpha": 0.6})
+            ax.set_title(f"Length vs E/Q (r={r:.2f})")
+            st.pyplot(fig_corr)
+        else:
+            st.warning("Not enough valid data points to compute correlation.")
+        st.session_state["fig_corr"] = fig_corr
+
+        # Histogram (valid)
+        st.subheader("📊 E/Q ratio distribution (valid proteins)")
+        fig_hist, axh = plt.subplots(figsize=(10, 5))
+        sns.histplot(df_valid["E/Q ratio"], bins=30, kde=True, ax=axh)
+        axh.set_title(f"E/Q ratio distribution (Chromosome {chrom_ok})")
+        axh.set_xlabel("E/Q ratio")
+        axh.set_ylabel("Protein count")
+        st.pyplot(fig_hist)
+        st.session_state["fig_hist"] = fig_hist
+
+        st.success("✅ Step 2 completed.")
+
+
+# =========================================================
+# STEP 3: Walking analysis (only after Step 2)
+# =========================================================
+if st.session_state["df_all"] is not None:
+    st.subheader("Step 3 — Walking (Surfing) analysis + chromosome-wide plot")
+
+    df_all = st.session_state["df_all"]
+    chrom_ok = st.session_state["chrom_ok"]
 
     st.write("""
-**Walking definition (implemented):**
-Given a selected frame size (window), the software slides a block along the protein list ordered by chromosome position.
-For each frame, it counts how many proteins have an **absolute count** above a fixed threshold **T** for:
-- the selected amino acid (AA),
-- **E**,
-- **Q**.
-
-The results are stored in **Surfing_*** columns.
-The table also includes:
-- **Frame start bp** and **Frame end bp**,
-- the **protein accessions** in the frame (**Protein_1 ... Protein_window**).
+Walking definition (implemented):
+A sliding window of fixed size (number of proteins) is moved along the chromosome-ordered protein list (sorted by Gene start bp).
+For each window, we count how many proteins have an absolute count > T for:
+- selected amino acid (AA)
+- E
+- Q
 """)
 
     aa_selected = st.selectbox("Amino acid for walking (AA):", options=AA_ORDER, index=AA_ORDER.index("E"))
     window = st.slider("Frame size (window)", min_value=5, max_value=200, value=25, step=1)
     threshold = st.number_input("Threshold T (AA count > T)", min_value=0.0, value=49.0, step=1.0)
 
-    # Plot controls
     x_axis_choice = st.radio("Walking plot X-axis:", options=["Frame start bp", "Frame #"], horizontal=True)
     smooth = st.checkbox("Smooth curves (rolling mean)", value=True)
     smooth_window = st.slider("Smoothing window (frames)", 1, 200, 25, 1) if smooth else 1
 
-    df_for_walk = df_all.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
+    run_step3 = st.button("3) Generate walking analysis")
 
-    try:
-        walk_df = make_walk_table(
-            df_all_sorted=df_for_walk,
-            window=window,
-            threshold=threshold,
-            aa_selected=aa_selected,
-            accession_col="Entry",
-            pos_col="Gene start (bp)",
-        )
-    except Exception as e:
-        st.error(f"Walking analysis error: {e}")
-        walk_df = pd.DataFrame()
+    if run_step3:
+        df_for_walk = df_all.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
 
-    fig_walk = None
-    if walk_df.empty:
-        st.warning("Not enough proteins to compute the walking table with the selected frame size.")
-    else:
+        try:
+            walk_df = make_walk_table(
+                df_all_sorted=df_for_walk,
+                window=window,
+                threshold=threshold,
+                aa_selected=aa_selected,
+                accession_col="Entry",
+                pos_col="Gene start (bp)",
+            )
+        except Exception as e:
+            st.error(f"Walking analysis error: {e}")
+            st.stop()
+
+        if walk_df.empty:
+            st.warning("Not enough proteins to compute the walking table with the selected frame size.")
+            st.stop()
+
+        st.session_state["walk_df"] = walk_df
+
         st.caption(f"Walking table rows: {len(walk_df)} (computed as N - window + 1)")
         st.dataframe(walk_df)
 
-        # -------- Quick chromosome-wide plot --------
+        # Quick chromosome plot
         st.subheader("📈 Walking quick plot (chromosome overview)")
-
         x_col = "Frame start bp" if x_axis_choice == "Frame start bp" else "Frame #"
         y_cols = [f"Surfing_{aa_selected}", "Surfing_E", "Surfing_Q"]
 
-        plot_df = walk_df[[x_col] + y_cols].copy()
-        plot_df = plot_df.sort_values(by=x_col)
+        plot_df = walk_df[[x_col] + y_cols].copy().sort_values(by=x_col)
 
         if smooth and smooth_window > 1:
             for yc in y_cols:
@@ -416,14 +470,15 @@ The table also includes:
         fig_walk, axw = plt.subplots(figsize=(12, 5))
         for yc in y_cols:
             axw.plot(plot_df[x_col], plot_df[yc], label=yc)
-
         axw.set_title(f"Walking (window={window}, T={threshold}) — Chromosome {chrom_ok}")
         axw.set_xlabel(x_col)
         axw.set_ylabel("Count of proteins in frame with (AA count > T)")
         axw.legend()
         st.pyplot(fig_walk)
 
-        # Downloads
+        st.session_state["fig_walk"] = fig_walk
+
+        # CSV download
         csv_bytes = walk_df.to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download Walking table (CSV)",
@@ -432,16 +487,36 @@ The table also includes:
             mime="text/csv",
         )
 
-    # ---------------------------------------------------------
-    # Excel export
-    # ---------------------------------------------------------
-    st.subheader("⬇️ Export Excel")
+        st.success("✅ Step 3 completed.")
+
+
+# =========================================================
+# Excel export (available after Step 2)
+# =========================================================
+if (
+    st.session_state["df_all"] is not None
+    and st.session_state["df_valid"] is not None
+    and st.session_state["avg_comp_all"] is not None
+    and st.session_state["eq_summary_df"] is not None
+):
+    st.subheader("⬇️ Export Excel (available after Step 2)")
+
+    df_all = st.session_state["df_all"]
+    df_valid = st.session_state["df_valid"]
+    avg_comp_all = st.session_state["avg_comp_all"]
+    eq_summary_df = st.session_state["eq_summary_df"]
+
+    walk_df = st.session_state.get("walk_df")
+    fig_hist = st.session_state.get("fig_hist")
+    fig_corr = st.session_state.get("fig_corr")
+    fig_walk = st.session_state.get("fig_walk")
+
     excel_bytes = to_excel_bytes(
         df_all=df_all,
         df_valid=df_valid,
         avg_comp_all=avg_comp_all,
         eq_summary_df=eq_summary_df,
-        walk_df=walk_df if not walk_df.empty else None,
+        walk_df=walk_df if isinstance(walk_df, pd.DataFrame) else None,
         fig_hist=fig_hist,
         fig_corr=fig_corr,
         fig_walk=fig_walk,
@@ -450,8 +525,6 @@ The table also includes:
     st.download_button(
         label="Download Excel (All + Valid EQ + AverageAA + Stats + Walking + Plots)",
         data=excel_bytes,
-        file_name=f"chromosome_{chrom_ok}_EQ_summary.xlsx",
+        file_name=f"chromosome_{st.session_state['chrom_ok']}_EQ_summary.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
-
-    st.success("✅ Analysis completed.")

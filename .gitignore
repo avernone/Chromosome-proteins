@@ -1,1 +1,4 @@
 .pybiomart.sqlite
+__pycache__/
+*.pyc
+*.log
