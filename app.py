@@ -29,6 +29,34 @@ Button-driven workflow (to avoid long automatic reruns on large chromosomes):
 3) Generate the **Walking (Surfing) analysis** (AA selected + E + Q only) + quick chromosome-wide plot
 """)
 
+# --- Amino Acid Reference Table ---
+with st.expander("📘 Amino Acid Reference Table (click to view)", expanded=False):
+    aa_data = [
+        ["Alanine", "Ala", "A"],
+        ["Arginine", "Arg", "R"],
+        ["Asparagine", "Asn", "N"],
+        ["Aspartic acid", "Asp", "D"],
+        ["Cysteine", "Cys", "C"],
+        ["Glutamine", "Gln", "Q"],
+        ["Glutamic acid", "Glu", "E"],
+        ["Glycine", "Gly", "G"],
+        ["Histidine", "His", "H"],
+        ["Isoleucine", "Ile", "I"],
+        ["Leucine", "Leu", "L"],
+        ["Lysine", "Lys", "K"],
+        ["Methionine", "Met", "M"],
+        ["Phenylalanine", "Phe", "F"],
+        ["Proline", "Pro", "P"],
+        ["Serine", "Ser", "S"],
+        ["Threonine", "Thr", "T"],
+        ["Tryptophan", "Trp", "W"],
+        ["Tyrosine", "Tyr", "Y"],
+        ["Valine", "Val", "V"]
+    ]
+
+    aa_df = pd.DataFrame(aa_data, columns=["Full Name", "3-letter", "1-letter"])
+    st.dataframe(aa_df, hide_index=True, use_container_width=True)
+
 chromosome = st.text_input("Chromosome (1–22, X, Y):", "").strip()
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
 
