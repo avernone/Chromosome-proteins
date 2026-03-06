@@ -24,38 +24,10 @@ st.write("""
 Enter a **human chromosome (1–22, X, Y)**.
 
 Button-driven workflow (to avoid long automatic reruns on large chromosomes):
-1) Generate the **full protein table** (Ensembl + Swiss-Prot mapping + peptide)
-2) Generate the **E/Q analysis** (compute AA counts + E/Q, statistics, plots)
+1) Generate the **full protein table** (Ensembl + Swiss-Prot mapping + peptide) — show only a preview + download
+2) Generate the **E/Q analysis** (compute AA counts + E/Q, statistics, plots) — show only a preview + download
 3) Generate the **Walking (Surfing) analysis** (AA selected + E + Q only) + quick chromosome-wide plot
 """)
-
-# --- Amino Acid Reference Table ---
-with st.expander("📘 Amino Acid Reference Table (click to view)", expanded=False):
-    aa_data = [
-        ["Alanine", "Ala", "A"],
-        ["Arginine", "Arg", "R"],
-        ["Asparagine", "Asn", "N"],
-        ["Aspartic acid", "Asp", "D"],
-        ["Cysteine", "Cys", "C"],
-        ["Glutamine", "Gln", "Q"],
-        ["Glutamic acid", "Glu", "E"],
-        ["Glycine", "Gly", "G"],
-        ["Histidine", "His", "H"],
-        ["Isoleucine", "Ile", "I"],
-        ["Leucine", "Leu", "L"],
-        ["Lysine", "Lys", "K"],
-        ["Methionine", "Met", "M"],
-        ["Phenylalanine", "Phe", "F"],
-        ["Proline", "Pro", "P"],
-        ["Serine", "Ser", "S"],
-        ["Threonine", "Thr", "T"],
-        ["Tryptophan", "Trp", "W"],
-        ["Tyrosine", "Tyr", "Y"],
-        ["Valine", "Val", "V"]
-    ]
-
-    aa_df = pd.DataFrame(aa_data, columns=["Full Name", "3-letter", "1-letter"])
-    st.dataframe(aa_df, hide_index=True, use_container_width=True)
 
 chromosome = st.text_input("Chromosome (1–22, X, Y):", "").strip()
 AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
@@ -63,13 +35,24 @@ AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
 # =========================================================
 # Session state init
 # =========================================================
-for k in ["chrom_ok", "ensembl_df", "df_all", "df_valid", "eq_summary_df", "avg_comp_all", "walk_df", "fig_corr", "fig_hist", "fig_walk"]:
+for k in [
+    "chrom_ok",
+    "ensembl_df",
+    "df_all",
+    "df_valid",
+    "eq_summary_df",
+    "avg_comp_all",
+    "walk_df",
+    "fig_corr",
+    "fig_hist",
+    "fig_walk",
+]:
     if k not in st.session_state:
         st.session_state[k] = None
 
 
 # =========================================================
-# Data fetch (Ensembl / BioMart)  -- keep the "old" code (http)
+# Data fetch (Ensembl / BioMart) -- keep http (as requested)
 # =========================================================
 @st.cache_data(show_spinner=False)
 def fetch_ensembl_chromosome_data(chrom: str) -> pd.DataFrame:
@@ -97,11 +80,6 @@ def fetch_ensembl_chromosome_data(chrom: str) -> pd.DataFrame:
             "uniprotswissprot": "Entry",
             "peptide": "Sequence",
             # Friendly labels (if returned)
-            "Gene stable ID": "Gene stable ID",
-            "Gene name": "Gene name",
-            "Gene start (bp)": "Gene start (bp)",
-            "Gene end (bp)": "Gene end (bp)",
-            "Chromosome/scaffold name": "Chromosome/scaffold name",
             "UniProtKB/Swiss-Prot ID": "Entry",
             "Peptide": "Sequence",
         }
@@ -112,7 +90,6 @@ def fetch_ensembl_chromosome_data(chrom: str) -> pd.DataFrame:
     df = df.dropna(subset=["Entry", "Sequence"]).copy()
 
     df["Sequence"] = df["Sequence"].astype(str).str.rstrip("*")
-
     df["Gene start (bp)"] = pd.to_numeric(df["Gene start (bp)"], errors="coerce")
     df["Gene end (bp)"] = pd.to_numeric(df["Gene end (bp)"], errors="coerce")
 
@@ -152,7 +129,6 @@ def add_aa_counts_and_eq(df: pd.DataFrame, batch_size: int = 200) -> pd.DataFram
             row["Length"] = len(seq)
             row["E/Q ratio"] = eq
             row["E/Q valid"] = eq_valid
-
             batch_rows.append(row)
 
         aa_rows.append(pd.DataFrame(batch_rows))
@@ -229,7 +205,7 @@ def make_walk_table(
 
 
 # =========================================================
-# Excel export
+# Excel export helper (same as before)
 # =========================================================
 def to_excel_bytes(
     df_all: pd.DataFrame,
@@ -270,6 +246,7 @@ def to_excel_bytes(
             if sheetw is None:
                 sheetw = writer.book.add_worksheet("Walking")
                 writer.sheets["Walking"] = sheetw
+
             imgdata3 = io.BytesIO()
             fig_walk.savefig(imgdata3, format="png", bbox_inches="tight")
             imgdata3.seek(0)
@@ -279,7 +256,59 @@ def to_excel_bytes(
 
 
 # =========================================================
-# STEP 1: Fetch Ensembl + show full raw table
+# Utility: table preview + optional "show full" checkbox + downloads
+# =========================================================
+def show_preview_and_downloads(
+    df: pd.DataFrame,
+    title: str,
+    preview_cols: list[str],
+    base_filename: str,
+    include_full_csv: bool = True,
+):
+    st.subheader(title)
+
+    preview_n = st.number_input(
+        f"Preview rows for: {title}",
+        min_value=1,
+        max_value=100,
+        value=5,
+        step=1,
+        key=f"preview_n_{title}",
+    )
+
+    st.caption("Preview only (to keep the app responsive). Full table can be downloaded.")
+    st.dataframe(df[preview_cols].head(preview_n), use_container_width=True)
+
+    if st.checkbox(f"Show full table: {title} (may be slow)", value=False, key=f"show_full_{title}"):
+        st.warning("Rendering the full table can be slow for large chromosomes.")
+        st.dataframe(df[preview_cols], use_container_width=True)
+
+    # Downloads
+    if include_full_csv:
+        csv_bytes = df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label=f"⬇️ Download full table (CSV): {title}",
+            data=csv_bytes,
+            file_name=f"{base_filename}.csv",
+            mime="text/csv",
+            key=f"dl_csv_{title}",
+        )
+
+    # Optional: Excel download for the plain table (fast, no plots)
+    xlsx_out = io.BytesIO()
+    with pd.ExcelWriter(xlsx_out, engine="xlsxwriter") as w:
+        df.to_excel(w, index=False, sheet_name="Table")
+    st.download_button(
+        label=f"⬇️ Download full table (Excel): {title}",
+        data=xlsx_out.getvalue(),
+        file_name=f"{base_filename}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_xlsx_{title}",
+    )
+
+
+# =========================================================
+# STEP 1: Fetch Ensembl + show PREVIEW + downloads (no full render)
 # =========================================================
 st.subheader("Step 1 — Full protein table (raw Ensembl + Swiss-Prot mapping)")
 run_step1 = st.button("1) Generate full protein table")
@@ -308,26 +337,30 @@ if run_step1:
     st.session_state["ensembl_df"] = ensembl_df
 
     # Reset downstream results if chromosome changes
-    st.session_state["df_all"] = None
-    st.session_state["df_valid"] = None
-    st.session_state["walk_df"] = None
-    st.session_state["fig_corr"] = None
-    st.session_state["fig_hist"] = None
-    st.session_state["fig_walk"] = None
-    st.session_state["eq_summary_df"] = None
-    st.session_state["avg_comp_all"] = None
+    for kk in ["df_all", "df_valid", "walk_df", "fig_corr", "fig_hist", "fig_walk", "eq_summary_df", "avg_comp_all"]:
+        st.session_state[kk] = None
 
     st.success(f"✅ Found {len(ensembl_df)} rows (gene/protein) with Swiss-Prot mapping + peptide on chromosome {chrom_ok}.")
 
 if st.session_state["ensembl_df"] is not None:
     ensembl_df = st.session_state["ensembl_df"]
+    chrom_ok = st.session_state["chrom_ok"]
+
     cols_step1 = ["Gene stable ID", "Gene name", "Gene start (bp)", "Gene end (bp)", "Entry", "Sequence"]
     cols_step1 = [c for c in cols_step1 if c in ensembl_df.columns and c != "Chromosome/scaffold name"]
-    st.dataframe(ensembl_df[cols_step1])
+
+    show_preview_and_downloads(
+        df=ensembl_df,
+        title="Raw Ensembl table (Swiss-Prot mapping + peptide)",
+        preview_cols=cols_step1,
+        base_filename=f"chromosome_{chrom_ok}_ensembl_raw",
+        include_full_csv=True,
+    )
 
 
 # =========================================================
 # STEP 2: Compute AA counts + E/Q analysis and plots
+#         Show PREVIEW + downloads (avoid full render)
 # =========================================================
 if st.session_state["ensembl_df"] is not None:
     st.subheader("Step 2 — E/Q analysis (compute AA counts + statistics)")
@@ -342,8 +375,7 @@ if st.session_state["ensembl_df"] is not None:
 
         st.session_state["df_all"] = df_all
 
-        # Full table with AA counts + E/Q
-        st.subheader("📊 Full table with AA counts + E/Q")
+        # Prepare columns (no Chromosome/scaffold)
         cols_all = [
             "Gene stable ID",
             "Gene name",
@@ -355,7 +387,14 @@ if st.session_state["ensembl_df"] is not None:
             "E/Q valid",
         ] + AA_ORDER
         cols_all = [c for c in cols_all if c in df_all.columns and c != "Chromosome/scaffold name"]
-        st.dataframe(df_all[cols_all])
+
+        show_preview_and_downloads(
+            df=df_all[cols_all],
+            title="Full table with AA counts + E/Q",
+            preview_cols=cols_all,
+            base_filename=f"chromosome_{chrom_ok}_AAcounts_EQ_full",
+            include_full_csv=True,
+        )
 
         # E/Q usability report
         invalid_mask = ~df_all["E/Q valid"]
@@ -371,7 +410,7 @@ if st.session_state["ensembl_df"] is not None:
         if n_invalid > 0:
             with st.expander("Show rows with non-usable E/Q"):
                 show_bad_cols = [c for c in ["Gene stable ID", "Gene name", "Entry", "Length", "E", "Q", "E/Q ratio"] if c in df_all.columns]
-                st.dataframe(df_all.loc[invalid_mask, show_bad_cols])
+                st.dataframe(df_all.loc[invalid_mask, show_bad_cols], use_container_width=True)
 
         # Average AA composition on ALL proteins
         st.subheader("📈 Average amino acid composition (all proteins)")
@@ -482,7 +521,7 @@ For each window, we count how many proteins have an absolute count > T for:
         st.session_state["walk_df"] = walk_df
 
         st.caption(f"Walking table rows: {len(walk_df)} (computed as N - window + 1)")
-        st.dataframe(walk_df)
+        st.dataframe(walk_df, use_container_width=True)
 
         # Quick chromosome plot
         st.subheader("📈 Walking quick plot (chromosome overview)")
@@ -509,7 +548,7 @@ For each window, we count how many proteins have an absolute count > T for:
         # CSV download
         csv_bytes = walk_df.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="Download Walking table (CSV)",
+            label="⬇️ Download Walking table (CSV)",
             data=csv_bytes,
             file_name=f"chromosome_{chrom_ok}_walking_{aa_selected}_w{window}_T{int(threshold)}.csv",
             mime="text/csv",
@@ -519,7 +558,7 @@ For each window, we count how many proteins have an absolute count > T for:
 
 
 # =========================================================
-# Excel export (available after Step 2)
+# FINAL Excel export (available after Step 2)
 # =========================================================
 if (
     st.session_state["df_all"] is not None
@@ -527,7 +566,7 @@ if (
     and st.session_state["avg_comp_all"] is not None
     and st.session_state["eq_summary_df"] is not None
 ):
-    st.subheader("⬇️ Export Excel (available after Step 2)")
+    st.subheader("⬇️ Download final Excel (available after Step 2)")
 
     df_all = st.session_state["df_all"]
     df_valid = st.session_state["df_valid"]
@@ -539,20 +578,23 @@ if (
     fig_corr = st.session_state.get("fig_corr")
     fig_walk = st.session_state.get("fig_walk")
 
-    excel_bytes = to_excel_bytes(
-        df_all=df_all,
-        df_valid=df_valid,
-        avg_comp_all=avg_comp_all,
-        eq_summary_df=eq_summary_df,
-        walk_df=walk_df if isinstance(walk_df, pd.DataFrame) else None,
-        fig_hist=fig_hist,
-        fig_corr=fig_corr,
-        fig_walk=fig_walk,
-    )
+    # Create Excel only when user clicks (avoid heavy work on reruns)
+    if st.button("Generate final Excel file"):
+        with st.spinner("Creating Excel file..."):
+            excel_bytes = to_excel_bytes(
+                df_all=df_all,
+                df_valid=df_valid,
+                avg_comp_all=avg_comp_all,
+                eq_summary_df=eq_summary_df,
+                walk_df=walk_df if isinstance(walk_df, pd.DataFrame) else None,
+                fig_hist=fig_hist,
+                fig_corr=fig_corr,
+                fig_walk=fig_walk,
+            )
 
-    st.download_button(
-        label="Download Excel (All + Valid EQ + AverageAA + Stats + Walking + Plots)",
-        data=excel_bytes,
-        file_name=f"chromosome_{st.session_state['chrom_ok']}_EQ_summary.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        st.download_button(
+            label="⬇️ Download Excel (All + Valid EQ + AverageAA + Stats + Walking + Plots)",
+            data=excel_bytes,
+            file_name=f"chromosome_{st.session_state['chrom_ok']}_EQ_summary.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
