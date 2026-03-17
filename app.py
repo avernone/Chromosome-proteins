@@ -41,6 +41,7 @@ for k in [
     "df_gene",
     "df_protein_raw",
     "walk_df",
+    "eq_window_df",
     "df_all",
     "df_valid",
     "eq_summary_df",
@@ -48,12 +49,13 @@ for k in [
     "fig_corr",
     "fig_hist",
     "fig_walk",
+    "fig_eq_window",
 ]:
     if k not in st.session_state:
         st.session_state[k] = None
 
 # =========================================================
-# Amino Acid Reference Table (collapsed by default)
+# Amino Acid Reference Table
 # =========================================================
 with st.expander("📘 Amino Acid Reference Table (click to view)", expanded=False):
     aa_data = [
@@ -167,7 +169,6 @@ def fetch_ensembl_protein_level_raw(chrom: str) -> pd.DataFrame:
     df["Gene start (bp)"] = pd.to_numeric(df["Gene start (bp)"], errors="coerce")
     df["Gene end (bp)"] = pd.to_numeric(df["Gene end (bp)"], errors="coerce")
 
-    # explode AC list -> one row per accession
     df["Entry"] = df["Swiss-Prot ACs"].astype(str).str.split(";")
     df = df.explode("Entry")
     df["Entry"] = df["Entry"].astype(str).str.strip()
@@ -177,15 +178,21 @@ def fetch_ensembl_protein_level_raw(chrom: str) -> pd.DataFrame:
     df["SeqHash"] = df["Sequence"].astype(str).apply(lambda s: sha1_10(s))
 
     df["Entry_has_multiple_sequences"] = df.groupby("Entry")["SeqHash"].transform("nunique") > 1
-    df["Isoform detected"] = df["Entry"].astype(str).str.contains("-", regex=False) | df["Entry_has_multiple_sequences"]
+    df["Isoform detected"] = (
+        df["Entry"].astype(str).str.contains("-", regex=False)
+        | df["Entry_has_multiple_sequences"]
+    )
 
-    df = df.drop_duplicates(subset=["Entry", "Sequence", "Gene start (bp)", "Gene end (bp)"], keep="first")
+    df = df.drop_duplicates(
+        subset=["Entry", "Sequence", "Gene start (bp)", "Gene end (bp)"],
+        keep="first",
+    )
 
     return df.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
 
 
 # =========================================================
-# FAST AA counting (full for E/Q step)
+# FAST AA counting
 # =========================================================
 def fast_count_aa(seq: str) -> dict:
     seq = str(seq).rstrip("*").upper()
@@ -232,7 +239,7 @@ def add_aa_counts_and_eq_fast(df: pd.DataFrame, batch_size: int = 1200) -> pd.Da
 
 
 # =========================================================
-# Walking / Surfing (fast) + PROTEIN LIST per frame
+# Walking / Surfing
 # =========================================================
 def make_walk_table_fast_with_list(
     df_sorted: pd.DataFrame,
@@ -272,8 +279,6 @@ def make_walk_table_fast_with_list(
     frame_start_bp = pos[: n - window + 1]
     frame_end_bp = pos[window - 1 :]
 
-    # One single column with the proteins involved in each window
-    # (this is O(n*window); ok for typical windows like 25–100)
     prot_list = [";".join(acc[i : i + window]) for i in range(0, n - window + 1)]
 
     out = pd.DataFrame(
@@ -291,6 +296,51 @@ def make_walk_table_fast_with_list(
 
 
 # =========================================================
+# E/Q sliding-window table
+# =========================================================
+def make_eq_window_table(
+    df_sorted: pd.DataFrame,
+    window: int,
+    accession_col: str = "Entry",
+    pos_col: str = "Gene start (bp)",
+) -> pd.DataFrame:
+    n = len(df_sorted)
+    if n < window:
+        return pd.DataFrame()
+
+    work = df_sorted.copy()
+
+    work["E_count"] = work["Sequence"].astype(str).str.count("E")
+    work["Q_count"] = work["Sequence"].astype(str).str.count("Q")
+    work["E/Q ratio"] = work["E_count"] / work["Q_count"]
+    work.loc[work["Q_count"] == 0, "E/Q ratio"] = np.nan
+
+    pos = pd.to_numeric(work[pos_col], errors="coerce").to_numpy()
+    acc = work[accession_col].astype(str).to_numpy()
+    eq_vals = pd.to_numeric(work["E/Q ratio"], errors="coerce").to_numpy()
+
+    rows = []
+    for i in range(0, n - window + 1):
+        j = i + window
+
+        frame_eq = eq_vals[i:j]
+        frame_pos = pos[i:j]
+        frame_acc = acc[i:j]
+
+        row = {
+            "Frame #": i + 1,
+            "Frame start bp": float(frame_pos[0]) if len(frame_pos) else np.nan,
+            "Frame end bp": float(frame_pos[-1]) if len(frame_pos) else np.nan,
+            "Mean E/Q ratio": np.nanmean(frame_eq),
+            "Valid E/Q proteins in window": int(np.sum(~np.isnan(frame_eq))),
+            "Proteins in window": ";".join(frame_acc),
+        }
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+# =========================================================
 # Excel export
 # =========================================================
 def to_excel_bytes(
@@ -299,9 +349,11 @@ def to_excel_bytes(
     avg_comp_all: pd.Series,
     eq_summary_df: pd.DataFrame,
     walk_df: Optional[pd.DataFrame] = None,
+    eq_window_df: Optional[pd.DataFrame] = None,
     fig_hist=None,
     fig_corr=None,
     fig_walk=None,
+    fig_eq_window=None,
 ):
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
@@ -312,6 +364,9 @@ def to_excel_bytes(
 
         if walk_df is not None and not walk_df.empty:
             walk_df.to_excel(writer, index=False, sheet_name="Walking")
+
+        if eq_window_df is not None and not eq_window_df.empty:
+            eq_window_df.to_excel(writer, index=False, sheet_name="EQ_Window")
 
         if fig_hist is not None:
             sheet = writer.sheets["EQ_Summary_VALID"]
@@ -337,13 +392,29 @@ def to_excel_bytes(
             imgdata3.seek(0)
             sheetw.insert_image("A2", "walk_plot.png", {"image_data": imgdata3})
 
+        if fig_eq_window is not None and eq_window_df is not None and not eq_window_df.empty:
+            sheeteq = writer.sheets.get("EQ_Window")
+            if sheeteq is None:
+                sheeteq = writer.book.add_worksheet("EQ_Window")
+                writer.sheets["EQ_Window"] = sheeteq
+            imgdata4 = io.BytesIO()
+            fig_eq_window.savefig(imgdata4, format="png", bbox_inches="tight")
+            imgdata4.seek(0)
+            sheeteq.insert_image("A2", "eq_window_plot.png", {"image_data": imgdata4})
+
     return output.getvalue()
 
 
 # =========================================================
 # Utility: preview + downloads
 # =========================================================
-def preview_and_download(df: pd.DataFrame, preview_cols: list[str], title: str, base_filename: str, preview_default: int = 5):
+def preview_and_download(
+    df: pd.DataFrame,
+    preview_cols: list[str],
+    title: str,
+    base_filename: str,
+    preview_default: int = 5,
+):
     st.subheader(title)
     preview_n = st.number_input(
         f"Preview rows ({title})",
@@ -408,7 +479,19 @@ if run_step1:
 
     st.session_state["df_gene"] = df_gene
 
-    for kk in ["df_protein_raw", "walk_df", "df_all", "df_valid", "eq_summary_df", "avg_comp_all", "fig_corr", "fig_hist", "fig_walk"]:
+    for kk in [
+        "df_protein_raw",
+        "walk_df",
+        "eq_window_df",
+        "df_all",
+        "df_valid",
+        "eq_summary_df",
+        "avg_comp_all",
+        "fig_corr",
+        "fig_hist",
+        "fig_walk",
+        "fig_eq_window",
+    ]:
         st.session_state[kk] = None
 
     st.success(f"✅ Found {len(df_gene)} gene-level rows with Swiss-Prot mapping on chromosome {chrom_ok}.")
@@ -430,12 +513,11 @@ if st.session_state["df_gene"] is not None:
 
 
 # =========================================================
-# STEP 2 — Walking (immediately after Step 1)
+# STEP 2 — Walking
 # =========================================================
 if st.session_state["df_gene"] is not None:
     st.header("Step 2 — Walking (Surfing) analysis")
 
-    # Locked ON, not selectable
     st.checkbox(
         "Use Swiss-Prot reviewed only (recommended)",
         value=True,
@@ -467,7 +549,6 @@ if st.session_state["df_gene"] is not None:
             st.error("❌ No protein-level rows found (or no peptide available).")
             st.stop()
 
-        # explicit info column
         df_prot_raw["Is_reviewed"] = True
         st.session_state["df_protein_raw"] = df_prot_raw
 
@@ -532,6 +613,59 @@ if st.session_state["df_gene"] is not None:
         st.pyplot(fig_walk)
 
         st.session_state["fig_walk"] = fig_walk
+
+        # ---------------------------------------------------------
+        # E/Q sliding-window table + plot
+        # ---------------------------------------------------------
+        st.subheader("📊 E/Q sliding-window table")
+
+        eq_window_df = make_eq_window_table(
+            df_sorted=df_for_walk,
+            window=int(window),
+            accession_col="Entry",
+            pos_col="Gene start (bp)",
+        )
+
+        if eq_window_df.empty:
+            st.warning("Not enough proteins to compute the E/Q sliding-window table.")
+        else:
+            st.session_state["eq_window_df"] = eq_window_df
+
+            st.caption(f"E/Q window table rows: {len(eq_window_df)} (computed as N - window + 1)")
+            st.dataframe(eq_window_df.head(50), width="stretch")
+            st.caption("Showing first 50 rows only. Download the full E/Q window table below.")
+
+            eq_csv_bytes = eq_window_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="⬇️ Download full E/Q window table (CSV)",
+                data=eq_csv_bytes,
+                file_name=f"chromosome_{chrom_ok}_EQ_window_w{int(window)}.csv",
+                mime="text/csv",
+            )
+
+            st.subheader("📈 E/Q sliding-window plot (chromosome overview)")
+
+            eq_plot_df = eq_window_df.copy()
+            eq_x_col = "Frame start bp" if x_axis_choice == "Frame start bp" else "Frame #"
+
+            if smooth and smooth_window > 1:
+                eq_plot_df["Mean E/Q smoothed"] = eq_plot_df["Mean E/Q ratio"].rolling(
+                    window=int(smooth_window),
+                    min_periods=1
+                ).mean()
+                y_col = "Mean E/Q smoothed"
+            else:
+                y_col = "Mean E/Q ratio"
+
+            fig_eq_window, axeq = plt.subplots(figsize=(12, 5))
+            axeq.plot(eq_plot_df[eq_x_col], eq_plot_df[y_col])
+            axeq.set_title(f"E/Q sliding-window mean along chromosome {chrom_ok}")
+            axeq.set_xlabel(eq_x_col)
+            axeq.set_ylabel("Mean E/Q ratio")
+            st.pyplot(fig_eq_window)
+
+            st.session_state["fig_eq_window"] = fig_eq_window
+
         st.success("✅ Step 2 (walking) completed.")
 
 
@@ -610,7 +744,7 @@ if st.session_state["df_protein_raw"] is not None:
         corr_df = df_valid.dropna(subset=["Length", "E/Q ratio"])
         fig_corr = None
         if len(corr_df) > 2:
-            r, p = pearsonr(corr_df["Length"], corr_df["E/Q ratio"])
+            r, p = pearsonr(corr_df["Length"], df_valid.loc[corr_df.index, "E/Q ratio"])
             st.write(f"**Pearson r** = `{r:.3f}` (p = `{p:.3e}`)")
             fig_corr, ax = plt.subplots(figsize=(8, 5))
             sns.regplot(data=corr_df, x="Length", y="E/Q ratio", scatter_kws={"alpha": 0.6})
@@ -651,9 +785,11 @@ if (
                 avg_comp_all=st.session_state["avg_comp_all"],
                 eq_summary_df=st.session_state["eq_summary_df"],
                 walk_df=st.session_state.get("walk_df"),
+                eq_window_df=st.session_state.get("eq_window_df"),
                 fig_hist=st.session_state.get("fig_hist"),
                 fig_corr=st.session_state.get("fig_corr"),
                 fig_walk=st.session_state.get("fig_walk"),
+                fig_eq_window=st.session_state.get("fig_eq_window"),
             )
 
         st.download_button(
