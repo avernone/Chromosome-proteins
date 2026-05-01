@@ -1,152 +1,74 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
 import io
-import hashlib
+from typing import Tuple
+
 import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.stats import pearsonr
+from matplotlib.patches import Rectangle
+import numpy as np
+import pandas as pd
+import streamlit as st
 from pybiomart import Dataset
-from typing import Optional
-from collections import Counter
+from bioservices import UniProt
+from Bio.SeqUtils.ProtParam import ProteinAnalysis
 
-# =========================================================
-# Streamlit setup
-# =========================================================
-st.set_page_config(
-    page_title="Chromosome Amino Acid Composition and E/Q Ratio Explorer",
-    page_icon="🧬",
-    layout="wide",
-)
 
-st.title("🧬 Chromosome Amino Acid Composition and E/Q Ratio Explorer (Streamlit + Ensembl)")
+st.set_page_config(page_title="Chromosome Protein Analyzer", layout="wide")
 
-st.write("""
-Enter a **human chromosome (1–22, X, Y)**.
+AA_COLUMNS = [
+    "A", "C", "D", "E", "F", "G", "H", "I", "K", "L",
+    "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"
+]
 
-Workflow:
-- **Step 1 (gene-level):** gene table with **Swiss-Prot AC list** per gene (ACs separated by `;`)
-- **Step 2 (walking):** walking/surfing on the **protein list** ordered by chromosome position
-- **Step 3 (E/Q last):** full AA composition + E/Q ratio statistics and plots
-""")
 
-chromosome = st.text_input("Chromosome (1–22, X, Y):", "").strip()
-AA_ORDER = list("ACDEFGHIKLMNPQRSTVWY")
-
-# =========================================================
-# Session state init
-# =========================================================
-for k in [
-    "chrom_ok",
-    "df_gene",
-    "df_protein_raw",
-    "walk_df",
-    "eq_window_df",
-    "df_all",
-    "df_valid",
-    "eq_summary_df",
-    "avg_comp_all",
-    "fig_corr",
-    "fig_hist",
-    "fig_walk",
-    "fig_eq_window",
-]:
-    if k not in st.session_state:
-        st.session_state[k] = None
-
-# =========================================================
-# Amino Acid Reference Table
-# =========================================================
-with st.expander("📘 Amino Acid Reference Table (click to view)", expanded=False):
-    aa_data = [
-        ["Alanine", "Ala", "A"],
-        ["Arginine", "Arg", "R"],
-        ["Asparagine", "Asn", "N"],
-        ["Aspartic acid", "Asp", "D"],
-        ["Cysteine", "Cys", "C"],
-        ["Glutamine", "Gln", "Q"],
-        ["Glutamic acid", "Glu", "E"],
-        ["Glycine", "Gly", "G"],
-        ["Histidine", "His", "H"],
-        ["Isoleucine", "Ile", "I"],
-        ["Leucine", "Leu", "L"],
-        ["Lysine", "Lys", "K"],
-        ["Methionine", "Met", "M"],
-        ["Phenylalanine", "Phe", "F"],
-        ["Proline", "Pro", "P"],
-        ["Serine", "Ser", "S"],
-        ["Threonine", "Thr", "T"],
-        ["Tryptophan", "Trp", "W"],
-        ["Tyrosine", "Tyr", "Y"],
-        ["Valine", "Val", "V"],
-    ]
-    aa_df_ref = pd.DataFrame(aa_data, columns=["Full Name", "3-letter", "1-letter"])
-    st.dataframe(aa_df_ref, hide_index=True, width="stretch")
-
-# =========================================================
-# Helpers
-# =========================================================
-def normalize_biomart_columns(df: pd.DataFrame) -> pd.DataFrame:
-    rename_map = {
-        "ensembl_gene_id": "Gene stable ID",
-        "external_gene_name": "Gene name",
-        "start_position": "Gene start (bp)",
-        "end_position": "Gene end (bp)",
-        "chromosome_name": "Chromosome/scaffold name",
-        "uniprotswissprot": "Swiss-Prot ACs",
-        "peptide": "Sequence",
-        "UniProtKB/Swiss-Prot ID": "Swiss-Prot ACs",
-        "Peptide": "Sequence",
+def init_session_state() -> None:
+    defaults = {
+        "analysis_done": False,
+        "show_heatmap": False,
+        "canonical_df": None,
+        "df_ensembl": None,
+        "raw_uniprot": "",
+        "last_params": {},
     }
-    cols = {c: rename_map[c] for c in df.columns if c in rename_map}
-    return df.rename(columns=cols)
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 
-def sha1_10(s: str) -> str:
-    return hashlib.sha1(s.encode("utf-8")).hexdigest()[:10]
+def clean_sequence(seq: str) -> str:
+    if pd.isna(seq):
+        return ""
+    return str(seq).rstrip("*").strip()
 
 
-# =========================================================
-# Step 1 fetch (gene-level)
-# =========================================================
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
-def fetch_ensembl_gene_level(chrom: str) -> pd.DataFrame:
-    dataset = Dataset(name="hsapiens_gene_ensembl", host="http://www.ensembl.org")
-    df = dataset.query(
-        attributes=[
-            "ensembl_gene_id",
-            "external_gene_name",
-            "start_position",
-            "end_position",
-            "chromosome_name",
-            "uniprotswissprot",
-        ],
-        filters={"chromosome_name": [chrom]},
+def validate_chromosome(chromosome: str) -> str:
+    """Validate and normalize a human chromosome name.
+
+    Accepted values are 1-22, X, Y and MT.
+    Inputs such as chr1, chrX and chrMT are normalized.
+    """
+    if chromosome is None:
+        return ""
+
+    chrom = str(chromosome).strip().upper()
+
+    if chrom.startswith("CHR"):
+        chrom = chrom[3:]
+
+    valid_chromosomes = {str(i) for i in range(1, 23)}
+    valid_chromosomes.update({"X", "Y", "MT"})
+
+    if chrom in valid_chromosomes:
+        return chrom
+
+    return ""
+
+
+@st.cache_data(show_spinner=False)
+def fetch_ensembl_data(chromosome_number: str) -> pd.DataFrame:
+    dataset = Dataset(
+        name="hsapiens_gene_ensembl",
+        host="http://www.ensembl.org",
     )
-    df = normalize_biomart_columns(df)
 
-    df["Swiss-Prot ACs"] = df["Swiss-Prot ACs"].replace("", np.nan)
-    df = df.dropna(subset=["Swiss-Prot ACs"]).copy()
-
-    df["Gene start (bp)"] = pd.to_numeric(df["Gene start (bp)"], errors="coerce")
-    df["Gene end (bp)"] = pd.to_numeric(df["Gene end (bp)"], errors="coerce")
-
-    df = df.drop_duplicates(
-        subset=["Gene stable ID", "Gene start (bp)", "Gene end (bp)", "Swiss-Prot ACs"],
-        keep="first",
-    )
-
-    df["Isoform detected"] = df["Swiss-Prot ACs"].astype(str).str.contains("-", regex=False)
-
-    return df.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
-
-
-# =========================================================
-# Protein-level raw fetch (with peptides)
-# =========================================================
-@st.cache_data(show_spinner=False, ttl=24 * 3600)
-def fetch_ensembl_protein_level_raw(chrom: str) -> pd.DataFrame:
-    dataset = Dataset(name="hsapiens_gene_ensembl", host="http://www.ensembl.org")
     df = dataset.query(
         attributes=[
             "ensembl_gene_id",
@@ -157,644 +79,584 @@ def fetch_ensembl_protein_level_raw(chrom: str) -> pd.DataFrame:
             "uniprotswissprot",
             "peptide",
         ],
-        filters={"chromosome_name": [chrom]},
-    )
-    df = normalize_biomart_columns(df)
-
-    df["Swiss-Prot ACs"] = df["Swiss-Prot ACs"].replace("", np.nan)
-    df["Sequence"] = df["Sequence"].replace("", np.nan)
-    df = df.dropna(subset=["Swiss-Prot ACs", "Sequence"]).copy()
-
-    df["Sequence"] = df["Sequence"].astype(str).str.rstrip("*")
-    df["Gene start (bp)"] = pd.to_numeric(df["Gene start (bp)"], errors="coerce")
-    df["Gene end (bp)"] = pd.to_numeric(df["Gene end (bp)"], errors="coerce")
-
-    df["Entry"] = df["Swiss-Prot ACs"].astype(str).str.split(";")
-    df = df.explode("Entry")
-    df["Entry"] = df["Entry"].astype(str).str.strip()
-    df = df[df["Entry"].ne("")].copy()
-
-    df["SeqLen"] = df["Sequence"].astype(str).str.len()
-    df["SeqHash"] = df["Sequence"].astype(str).apply(lambda s: sha1_10(s))
-
-    df["Entry_has_multiple_sequences"] = df.groupby("Entry")["SeqHash"].transform("nunique") > 1
-    df["Isoform detected"] = (
-        df["Entry"].astype(str).str.contains("-", regex=False)
-        | df["Entry_has_multiple_sequences"]
+        filters={"chromosome_name": [chromosome_number]},
     )
 
-    df = df.drop_duplicates(
-        subset=["Entry", "Sequence", "Gene start (bp)", "Gene end (bp)"],
-        keep="first",
+    if df.empty:
+        return df
+
+    df = df.copy()
+
+    if "UniProtKB/Swiss-Prot ID" in df.columns:
+        df["UniProtKB/Swiss-Prot ID"] = df["UniProtKB/Swiss-Prot ID"].replace("", np.nan)
+
+    if "Peptide" in df.columns:
+        df["Peptide"] = df["Peptide"].apply(clean_sequence)
+
+    df = df.dropna(subset=["UniProtKB/Swiss-Prot ID", "Peptide"])
+    df = df[df["Peptide"] != ""].copy()
+    df["length"] = df["Peptide"].str.len()
+
+    df.rename(
+        columns={
+            "UniProtKB/Swiss-Prot ID": "id",
+            "Peptide": "sequence",
+        },
+        inplace=True,
+    )
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def fetch_uniprot_data(chromosome_number: str) -> Tuple[pd.DataFrame, str]:
+    service = UniProt()
+
+    query = (
+        f'proteomecomponent:"chromosome {chromosome_number}" '
+        f'AND organism_id:"9606" '
+        f'AND proteome:up000005640 '
+        f'AND reviewed:true'
     )
 
-    return df.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
+    result = service.search(query, frmt="tsv", columns="accession,id,length,sequence")
+
+    if not result or not result.strip():
+        return pd.DataFrame(columns=["id", "entry name", "length", "sequence"]), result
+
+    df = pd.read_table(io.StringIO(result))
+
+    rename_map = {}
+    if "Entry" in df.columns:
+        rename_map["Entry"] = "id"
+    if "Entry Name" in df.columns:
+        rename_map["Entry Name"] = "entry name"
+    if "Length" in df.columns:
+        rename_map["Length"] = "length"
+    if "Sequence" in df.columns:
+        rename_map["Sequence"] = "sequence"
+
+    df = df.rename(columns=rename_map)
+
+    for col in ["id", "entry name", "length", "sequence"]:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df = df[["id", "entry name", "length", "sequence"]].copy()
+    df["sequence"] = df["sequence"].apply(clean_sequence)
+    return df, result
 
 
-# =========================================================
-# FAST AA counting
-# =========================================================
-def fast_count_aa(seq: str) -> dict:
-    seq = str(seq).rstrip("*").upper()
-    c = Counter(seq)
-    return {aa: int(c.get(aa, 0)) for aa in AA_ORDER}
-
-
-def add_aa_counts_and_eq_fast(df: pd.DataFrame, batch_size: int = 1200) -> pd.DataFrame:
-    n = len(df)
-    progress = st.progress(0)
-    status = st.empty()
-
-    out_chunks = []
-    for start in range(0, n, batch_size):
-        end = min(start + batch_size, n)
-        batch = df.iloc[start:end]
-
-        rows = []
-        for seq in batch["Sequence"].astype(str):
-            s = str(seq).rstrip("*")
-            counts = fast_count_aa(s)
-            e = counts["E"]
-            q = counts["Q"]
-            eq = (e / q) if q != 0 else np.nan
-            rows.append(
-                {
-                    **counts,
-                    "Length": len(s),
-                    "E/Q ratio": eq,
-                    "E/Q valid": (q != 0),
-                }
-            )
-
-        out_chunks.append(pd.DataFrame(rows))
-        progress.progress(end / n)
-        status.write(f"Computed {end}/{n} proteins...")
-
-    progress.empty()
-    status.empty()
-
-    aa_df = pd.concat(out_chunks, ignore_index=True)
-    out = pd.concat([df.reset_index(drop=True), aa_df], axis=1)
-    return out
-
-
-# =========================================================
-# Walking / Surfing
-# =========================================================
-def make_walk_table_fast_with_list(
-    df_sorted: pd.DataFrame,
-    window: int,
-    threshold: float,
-    aa_selected: str,
-    accession_col: str = "Entry",
-    pos_col: str = "Gene start (bp)",
-) -> pd.DataFrame:
-    n = len(df_sorted)
-    if n < window:
+def merge_ensembl_uniprot(df_ensembl: pd.DataFrame, df_uniprot: pd.DataFrame) -> pd.DataFrame:
+    if df_ensembl.empty or df_uniprot.empty:
         return pd.DataFrame()
 
-    seqs = df_sorted["Sequence"].astype(str).tolist()
-    pos = pd.to_numeric(df_sorted[pos_col], errors="coerce").to_numpy()
-    acc = df_sorted[accession_col].astype(str).to_numpy()
+    merged = pd.merge(
+        df_ensembl,
+        df_uniprot,
+        on=["id", "length", "sequence"],
+        how="inner",
+    ).copy()
 
-    def count_letter(s: str, letter: str) -> int:
-        return str(s).count(letter)
-
-    aa_counts = np.array([count_letter(s, aa_selected) for s in seqs], dtype=np.int32)
-    e_counts = np.array([count_letter(s, "E") for s in seqs], dtype=np.int32)
-    q_counts = np.array([count_letter(s, "Q") for s in seqs], dtype=np.int32)
-
-    b_aa = (aa_counts > threshold).astype(np.int32)
-    b_e = (e_counts > threshold).astype(np.int32)
-    b_q = (q_counts > threshold).astype(np.int32)
-
-    def window_sum_bool(b: np.ndarray, w: int) -> np.ndarray:
-        cs = np.concatenate([[0], np.cumsum(b)])
-        return cs[w:] - cs[:-w]
-
-    surf_aa = window_sum_bool(b_aa, window)
-    surf_e = window_sum_bool(b_e, window)
-    surf_q = window_sum_bool(b_q, window)
-
-    frame_start_bp = pos[: n - window + 1]
-    frame_end_bp = pos[window - 1 :]
-
-    prot_list = [";".join(acc[i : i + window]) for i in range(0, n - window + 1)]
-
-    out = pd.DataFrame(
-        {
-            "Frame #": np.arange(1, n - window + 2, dtype=np.int32),
-            "Frame start bp": frame_start_bp,
-            "Frame end bp": frame_end_bp,
-            f"Surfing_{aa_selected}": surf_aa,
-            "Surfing_E": surf_e,
-            "Surfing_Q": surf_q,
-            "Proteins in window": prot_list,
-        }
-    )
-    return out
+    return merged
 
 
-# =========================================================
-# E/Q sliding-window table
-# =========================================================
-def make_eq_window_table(
-    df_sorted: pd.DataFrame,
-    window: int,
-    accession_col: str = "Entry",
-    pos_col: str = "Gene start (bp)",
-) -> pd.DataFrame:
-    n = len(df_sorted)
-    if n < window:
-        return pd.DataFrame()
-
-    work = df_sorted.copy()
-
-    work["E_count"] = work["Sequence"].astype(str).str.count("E")
-    work["Q_count"] = work["Sequence"].astype(str).str.count("Q")
-    work["E/Q ratio"] = work["E_count"] / work["Q_count"]
-    work.loc[work["Q_count"] == 0, "E/Q ratio"] = np.nan
-
-    pos = pd.to_numeric(work[pos_col], errors="coerce").to_numpy()
-    acc = work[accession_col].astype(str).to_numpy()
-    eq_vals = pd.to_numeric(work["E/Q ratio"], errors="coerce").to_numpy()
+def compute_amino_acid_counts(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame(columns=AA_COLUMNS)
 
     rows = []
-    for i in range(0, n - window + 1):
-        j = i + window
+    for seq in df["sequence"]:
+        counts = ProteinAnalysis(seq).count_amino_acids()
+        rows.append(counts)
 
-        frame_eq = eq_vals[i:j]
-        frame_pos = pos[i:j]
-        frame_acc = acc[i:j]
+    aa_df = pd.DataFrame(rows)
+    for col in AA_COLUMNS:
+        if col not in aa_df.columns:
+            aa_df[col] = 0
 
-        row = {
-            "Frame #": i + 1,
-            "Frame start bp": float(frame_pos[0]) if len(frame_pos) else np.nan,
-            "Frame end bp": float(frame_pos[-1]) if len(frame_pos) else np.nan,
-            "Mean E/Q ratio": np.nanmean(frame_eq),
-            "Valid E/Q proteins in window": int(np.sum(~np.isnan(frame_eq))),
-            "Proteins in window": ";".join(frame_acc),
-        }
-        rows.append(row)
+    return aa_df[AA_COLUMNS].copy()
+
+
+def build_canonical_table(merged_df: pd.DataFrame, aa_df: pd.DataFrame) -> pd.DataFrame:
+    if merged_df.empty:
+        return pd.DataFrame()
+
+    final_df = pd.concat(
+        [merged_df.reset_index(drop=True), aa_df.reset_index(drop=True)],
+        axis=1,
+    )
+
+    desired_columns = [
+        "Gene stable ID",
+        "Gene name",
+        "Gene start (bp)",
+        "Gene end (bp)",
+        "id",
+        "length",
+        "entry name",
+        *AA_COLUMNS,
+        "Chromosome/scaffold name",
+        "sequence",
+    ]
+
+    available = [c for c in desired_columns if c in final_df.columns]
+    final_df = final_df[available].copy()
+
+    if "Gene start (bp)" in final_df.columns:
+        final_df = final_df.sort_values(by="Gene start (bp)").reset_index(drop=True)
+
+    return final_df
+
+
+def _safe_join(values: pd.Series) -> str:
+    vals = [str(v) for v in values.tolist() if pd.notna(v) and str(v).strip() != ""]
+    return "; ".join(vals)
+
+
+def build_walking_table(
+    canonical_df: pd.DataFrame,
+    aa_selected: str,
+    window_size: int,
+    threshold: int,
+) -> pd.DataFrame:
+    if canonical_df.empty or aa_selected not in canonical_df.columns or len(canonical_df) < window_size:
+        return pd.DataFrame()
+
+    rows = []
+    values = canonical_df[aa_selected].reset_index(drop=True)
+
+    for start_idx in range(0, len(canonical_df) - window_size + 1):
+        end_idx = start_idx + window_size - 1
+        block = canonical_df.iloc[start_idx:end_idx + 1]
+        block_values = values.iloc[start_idx:end_idx + 1]
+        walking_count = int((block_values > threshold).sum())
+
+        rows.append(
+            {
+                "AA": aa_selected,
+                "window_size": int(window_size),
+                "threshold": int(threshold),
+                "frame_number": start_idx + 1,
+                "start_block_element": start_idx + 1,
+                "final_block_element": end_idx + 1,
+                "block_start_bp": int(block["Gene start (bp)"].iloc[0]),
+                "block_end_bp": int(block["Gene end (bp)"].iloc[-1]),
+                "walking_count": walking_count,
+                "first_gene_name": block["Gene name"].iloc[0] if "Gene name" in block.columns else "",
+                "last_gene_name": block["Gene name"].iloc[-1] if "Gene name" in block.columns else "",
+                "gene_names_in_window": _safe_join(block["Gene name"]) if "Gene name" in block.columns else "",
+                "gene_ids_in_window": _safe_join(block["Gene stable ID"]) if "Gene stable ID" in block.columns else "",
+            }
+        )
 
     return pd.DataFrame(rows)
 
 
-# =========================================================
-# Excel export
-# =========================================================
-def to_excel_bytes(
-    df_all: pd.DataFrame,
-    df_valid: pd.DataFrame,
-    avg_comp_all: pd.Series,
-    eq_summary_df: pd.DataFrame,
-    walk_df: Optional[pd.DataFrame] = None,
-    eq_window_df: Optional[pd.DataFrame] = None,
-    fig_hist=None,
-    fig_corr=None,
-    fig_walk=None,
-    fig_eq_window=None,
-):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-        df_all.to_excel(writer, index=False, sheet_name="AllProteins")
-        df_valid.to_excel(writer, index=False, sheet_name="Valid_EQ")
-        avg_comp_all.to_frame("Average (all proteins)").to_excel(writer, sheet_name="AverageAA_ALL")
-        eq_summary_df.to_excel(writer, sheet_name="EQ_Summary_VALID")
+def build_eq_ratio_table(canonical_df: pd.DataFrame, window_size: int, threshold: int) -> pd.DataFrame:
+    walking_e = build_walking_table(canonical_df, "E", window_size, threshold)
+    walking_q = build_walking_table(canonical_df, "Q", window_size, threshold)
 
-        if walk_df is not None and not walk_df.empty:
-            walk_df.to_excel(writer, index=False, sheet_name="Walking")
+    if walking_e.empty or walking_q.empty:
+        return pd.DataFrame()
 
-        if eq_window_df is not None and not eq_window_df.empty:
-            eq_window_df.to_excel(writer, index=False, sheet_name="EQ_Window")
-
-        if fig_hist is not None:
-            sheet = writer.sheets["EQ_Summary_VALID"]
-            imgdata = io.BytesIO()
-            fig_hist.savefig(imgdata, format="png", bbox_inches="tight")
-            imgdata.seek(0)
-            sheet.insert_image("D2", "eq_hist.png", {"image_data": imgdata})
-
-        if fig_corr is not None:
-            sheet = writer.sheets["EQ_Summary_VALID"]
-            imgdata2 = io.BytesIO()
-            fig_corr.savefig(imgdata2, format="png", bbox_inches="tight")
-            imgdata2.seek(0)
-            sheet.insert_image("D22", "corr.png", {"image_data": imgdata2})
-
-        if fig_walk is not None and walk_df is not None and not walk_df.empty:
-            sheetw = writer.sheets.get("Walking")
-            if sheetw is None:
-                sheetw = writer.book.add_worksheet("Walking")
-                writer.sheets["Walking"] = sheetw
-            imgdata3 = io.BytesIO()
-            fig_walk.savefig(imgdata3, format="png", bbox_inches="tight")
-            imgdata3.seek(0)
-            sheetw.insert_image("A2", "walk_plot.png", {"image_data": imgdata3})
-
-        if fig_eq_window is not None and eq_window_df is not None and not eq_window_df.empty:
-            sheeteq = writer.sheets.get("EQ_Window")
-            if sheeteq is None:
-                sheeteq = writer.book.add_worksheet("EQ_Window")
-                writer.sheets["EQ_Window"] = sheeteq
-            imgdata4 = io.BytesIO()
-            fig_eq_window.savefig(imgdata4, format="png", bbox_inches="tight")
-            imgdata4.seek(0)
-            sheeteq.insert_image("A2", "eq_window_plot.png", {"image_data": imgdata4})
-
-    return output.getvalue()
-
-
-# =========================================================
-# Utility: preview + downloads
-# =========================================================
-def preview_and_download(
-    df: pd.DataFrame,
-    preview_cols: list[str],
-    title: str,
-    base_filename: str,
-    preview_default: int = 5,
-):
-    st.subheader(title)
-    preview_n = st.number_input(
-        f"Preview rows ({title})",
-        min_value=1,
-        max_value=200,
-        value=preview_default,
-        step=1,
-        key=f"preview_{base_filename}",
-    )
-    st.caption("Preview only to keep the app responsive. Download the full table below.")
-    st.dataframe(df[preview_cols].head(int(preview_n)), width="stretch")
-
-    csv_bytes = df[preview_cols].to_csv(index=False).encode("utf-8")
-    st.download_button(
-        label=f"⬇️ Download full table (CSV): {title}",
-        data=csv_bytes,
-        file_name=f"{base_filename}.csv",
-        mime="text/csv",
-        key=f"csv_{base_filename}",
-    )
-
-    out = io.BytesIO()
-    with pd.ExcelWriter(out, engine="xlsxwriter") as w:
-        df[preview_cols].to_excel(w, index=False, sheet_name="Table")
-    st.download_button(
-        label=f"⬇️ Download full table (Excel): {title}",
-        data=out.getvalue(),
-        file_name=f"{base_filename}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"xlsx_{base_filename}",
-    )
-
-
-# =========================================================
-# STEP 1 — Gene-level table
-# =========================================================
-st.header("Step 1 — Gene-level table (show everything)")
-st.caption("Gene-centric table (NOT protein-centric). **Swiss-Prot ACs** may contain multiple accessions separated by ';'.")
-
-run_step1 = st.button("1) Generate gene-level table")
-
-if run_step1:
-    if not chromosome:
-        st.error("Please enter a chromosome first.")
-        st.stop()
-
-    chrom_ok = chromosome.upper()
-    if chrom_ok not in ["X", "Y"]:
-        chrom_ok = chromosome
-    st.session_state["chrom_ok"] = chrom_ok
-
-    with st.spinner(f"Fetching Ensembl gene-level data for chromosome {chrom_ok}..."):
-        try:
-            df_gene = fetch_ensembl_gene_level(chrom_ok)
-        except Exception as e:
-            st.error(f"Ensembl/pybiomart error (Step 1): {e}")
-            st.stop()
-
-    if df_gene.empty:
-        st.error("❌ No Ensembl rows found for this chromosome (or no Swiss-Prot mapping available).")
-        st.stop()
-
-    st.session_state["df_gene"] = df_gene
-
-    for kk in [
-        "df_protein_raw",
-        "walk_df",
-        "eq_window_df",
-        "df_all",
-        "df_valid",
-        "eq_summary_df",
-        "avg_comp_all",
-        "fig_corr",
-        "fig_hist",
-        "fig_walk",
-        "fig_eq_window",
-    ]:
-        st.session_state[kk] = None
-
-    st.success(f"✅ Found {len(df_gene)} gene-level rows with Swiss-Prot mapping on chromosome {chrom_ok}.")
-
-if st.session_state["df_gene"] is not None:
-    df_gene = st.session_state["df_gene"]
-    chrom_ok = st.session_state["chrom_ok"]
-
-    cols_step1 = ["Gene stable ID", "Gene name", "Gene start (bp)", "Gene end (bp)", "Swiss-Prot ACs", "Isoform detected"]
-    cols_step1 = [c for c in cols_step1 if c in df_gene.columns and c != "Chromosome/scaffold name"]
-
-    preview_and_download(
-        df=df_gene,
-        preview_cols=cols_step1,
-        title="Table 1 — Gene-level mapping (Swiss-Prot AC list per gene)",
-        base_filename=f"chromosome_{chrom_ok}_table1_gene_level",
-        preview_default=10,
-    )
-
-
-# =========================================================
-# STEP 2 — Walking
-# =========================================================
-if st.session_state["df_gene"] is not None:
-    st.header("Step 2 — Walking (Surfing) analysis")
-
-    st.checkbox(
-        "Use Swiss-Prot reviewed only (recommended)",
-        value=True,
-        disabled=True,
-        help="BioMart attribute 'uniprotswissprot' already returns Swiss-Prot (reviewed) accessions.",
-    )
-
-    aa_selected = st.selectbox("Amino acid for walking (AA):", options=AA_ORDER, index=AA_ORDER.index("D"))
-    window = st.slider("Frame size (window)", min_value=5, max_value=300, value=25, step=1)
-    threshold = st.number_input("Threshold T (AA count > T)", min_value=0.0, value=49.0, step=1.0)
-
-    x_axis_choice = st.radio("Walking plot X-axis:", options=["Frame start bp", "Frame #"], horizontal=True)
-    smooth = st.checkbox("Smooth curves (rolling mean)", value=True)
-    smooth_window = st.slider("Smoothing window (frames)", 1, 300, 25, 1) if smooth else 1
-
-    run_step2 = st.button("2) Generate walking analysis")
-
-    if run_step2:
-        chrom_ok = st.session_state["chrom_ok"]
-
-        with st.spinner(f"Fetching Ensembl protein-level data (with peptides) for chromosome {chrom_ok}..."):
-            try:
-                df_prot_raw = fetch_ensembl_protein_level_raw(chrom_ok)
-            except Exception as e:
-                st.error(f"Ensembl/pybiomart error (Step 2 fetch): {e}")
-                st.stop()
-
-        if df_prot_raw.empty:
-            st.error("❌ No protein-level rows found (or no peptide available).")
-            st.stop()
-
-        df_prot_raw["Is_reviewed"] = True
-        st.session_state["df_protein_raw"] = df_prot_raw
-
-        cols_raw = [
-            "Gene stable ID", "Gene name", "Gene start (bp)", "Gene end (bp)",
-            "Entry", "Is_reviewed", "SeqLen", "SeqHash", "Entry_has_multiple_sequences", "Isoform detected"
+    eq_df = walking_e[
+        [
+            "frame_number",
+            "start_block_element",
+            "final_block_element",
+            "block_start_bp",
+            "block_end_bp",
+            "first_gene_name",
+            "last_gene_name",
+            "gene_names_in_window",
+            "gene_ids_in_window",
         ]
-        preview_and_download(
-            df=df_prot_raw.drop(columns=["Sequence"], errors="ignore"),
-            preview_cols=[c for c in cols_raw if c in df_prot_raw.columns],
-            title="Protein-level raw table (used for walking & E/Q) — Sequence not shown in preview",
-            base_filename=f"chromosome_{chrom_ok}_protein_raw",
-            preview_default=10,
-        )
+    ].copy()
+    eq_df["E_count"] = walking_e["walking_count"].values
+    eq_df["Q_count"] = walking_q["walking_count"].values
+    q_counts = eq_df["Q_count"].replace(0, np.nan)
+    eq_df["E_Q_ratio"] = (eq_df["E_count"] / q_counts).replace([np.inf, -np.inf], np.nan)
+    return eq_df
 
-        df_for_walk = df_prot_raw.sort_values(by=["Gene start (bp)"], na_position="last").reset_index(drop=True)
 
-        with st.spinner("Computing Walking table (fast)..."):
-            walk_df = make_walk_table_fast_with_list(
-                df_sorted=df_for_walk,
-                window=int(window),
-                threshold=float(threshold),
-                aa_selected=str(aa_selected),
+def build_walking_heatmap(canonical_df: pd.DataFrame, window_size: int, threshold: int):
+    if canonical_df.empty or len(canonical_df) < window_size:
+        return None
+
+    heatmap_data = []
+    valid_aa = []
+
+    for aa in AA_COLUMNS:
+        walking_df = build_walking_table(canonical_df, aa, window_size, threshold)
+        if walking_df.empty:
+            continue
+        heatmap_data.append(walking_df["walking_count"].values / window_size)
+        valid_aa.append(aa)
+
+    if not heatmap_data:
+        return None
+
+    heatmap_array = np.array(heatmap_data)
+    fig, ax = plt.subplots(figsize=(12, 6))
+    im = ax.imshow(heatmap_array, aspect="auto", vmin=0, vmax=1)
+    ax.set_yticks(range(len(valid_aa)))
+    ax.set_yticklabels(valid_aa)
+    ax.set_xlabel("Frame number")
+    ax.set_ylabel("Amino acid")
+    ax.set_title("Walking heatmap (frequency of proteins with AA > T)")
+    cbar = plt.colorbar(im, ax=ax)
+    cbar.set_label("Frequency (0-1)")
+    return fig
+
+
+def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def dataframe_to_xlsx_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name[:31])
+    buffer.seek(0)
+    return buffer.getvalue()
+
+
+def build_figure_b(walking_df: pd.DataFrame):
+    fig, ax = plt.subplots(figsize=(8, 4.8))
+    ax.plot(
+        walking_df["frame_number"],
+        walking_df["walking_count"],
+        marker="o",
+        linewidth=1.8,
+    )
+    ax.set_xlabel("Frame number")
+    ax.set_ylabel("Number of proteins with X > T")
+    ax.set_title("Walking analysis")
+    ax.set_xticks(walking_df["frame_number"])
+    ax.grid(True, axis="y")
+    return fig
+
+
+def build_figure_a(canonical_df: pd.DataFrame, aa_selected: str, threshold: int, window_size: int):
+    if canonical_df.empty:
+        return None
+
+    n_show = len(canonical_df)
+    values = canonical_df[aa_selected].reset_index(drop=True)
+    enriched = values > threshold
+
+    n_frames = max(0, n_show - window_size + 1)
+    if n_frames == 0:
+        fig, ax = plt.subplots(figsize=(10, 2.5))
+        ax.text(0.5, 0.5, "Not enough proteins for schematic walking panel.", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    frame_counts = []
+    for start_idx in range(n_frames):
+        end_idx = start_idx + window_size - 1
+        frame_counts.append(int((values.iloc[start_idx:end_idx + 1] > threshold).sum()))
+    max_frame = int(np.argmax(frame_counts))
+
+    fig_w = min(28, max(14, 0.22 * n_show + 6))
+    fig_h = min(28, max(5, 2.5 + 0.18 * n_frames))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    y_top = n_frames + 2
+    row_font = max(5, min(9, 10 - n_frames * 0.06))
+    label_font = max(5, min(9, 10 - n_show * 0.02))
+
+    for i in range(n_show):
+        face = "red" if enriched.iloc[i] else "white"
+        ax.add_patch(
+            Rectangle(
+                (i + 1 - 0.45, y_top),
+                0.9,
+                0.42,
+                facecolor=face,
+                edgecolor="black",
+                linewidth=0.8,
             )
-
-        if walk_df.empty:
-            st.warning("Not enough proteins to compute the walking table with the selected frame size.")
-            st.stop()
-
-        st.session_state["walk_df"] = walk_df
-
-        st.subheader("Walking table preview")
-        st.caption(f"Walking table rows: {len(walk_df)} (computed as N - window + 1)")
-        st.dataframe(walk_df.head(50), width="stretch")
-        st.caption("Showing first 50 rows only. Download the full walking table below.")
-
-        csv_bytes = walk_df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            label="⬇️ Download full Walking table (CSV)",
-            data=csv_bytes,
-            file_name=f"chromosome_{chrom_ok}_walking_{aa_selected}_w{int(window)}_T{int(threshold)}.csv",
-            mime="text/csv",
         )
 
-        st.subheader("📈 Walking quick plot (chromosome overview)")
-        x_col = "Frame start bp" if x_axis_choice == "Frame start bp" else "Frame #"
-        y_cols = [f"Surfing_{aa_selected}", "Surfing_E", "Surfing_Q"]
+    ax.text((n_show + 1) / 2, y_top + 0.68, "ORDERED LIST OF PROTEINS CODIFIED BY A CHROMOSOME",
+            ha="center", va="bottom", fontsize=label_font)
+    ax.text(-1.6, y_top + 0.2, "FRAME\nNUMBER", ha="center", va="center", fontsize=label_font)
 
-        plot_df = walk_df[[x_col] + y_cols].copy().sort_values(by=x_col)
+    for frame_idx in range(n_frames):
+        row_y = n_frames - frame_idx + 1
+        start = frame_idx + 1
+        end = frame_idx + window_size
+        color = "red" if frame_idx == max_frame else "black"
+        count = frame_counts[frame_idx]
+        ax.text(-0.2, row_y, str(frame_idx + 1), ha="right", va="center", fontsize=row_font, color=color)
+        ax.plot([start, start], [y_top, row_y], color="gray", linewidth=1)
+        ax.plot([end, end], [y_top, row_y], color="gray", linewidth=1)
+        ax.plot([start, end], [row_y, row_y], color="gray", linewidth=1)
+        ax.text((start + end) / 2, row_y + 0.1, f"{count} proteins X > T",
+                ha="center", va="bottom", fontsize=row_font, color=color)
 
-        if smooth and smooth_window > 1:
-            for yc in y_cols:
-                plot_df[yc] = plot_df[yc].rolling(window=int(smooth_window), min_periods=1).mean()
+    ax.set_xlim(-2, n_show + 2)
+    ax.set_ylim(0.5, y_top + 1.2)
+    ax.axis("off")
+    ax.set_title("Figure A style schematic walking panel")
+    return fig
 
-        fig_walk, axw = plt.subplots(figsize=(12, 5))
-        for yc in y_cols:
-            axw.plot(plot_df[x_col], plot_df[yc], label=yc)
-        axw.set_title(f"Walking (window={int(window)}, T={float(threshold)}) — Chromosome {chrom_ok}")
-        axw.set_xlabel(x_col)
-        axw.set_ylabel("Count of proteins in frame with (AA count > T)")
-        axw.legend()
-        st.pyplot(fig_walk)
 
-        st.session_state["fig_walk"] = fig_walk
+def build_aa_profile_plot(canonical_df: pd.DataFrame, aa_selected: str, threshold: int):
+    profile_df = canonical_df.reset_index(drop=True).copy()
+    profile_df["protein_order"] = np.arange(1, len(profile_df) + 1)
+    enriched = profile_df[aa_selected] > threshold
 
-        # ---------------------------------------------------------
-        # E/Q sliding-window table + plot
-        # ---------------------------------------------------------
-        st.subheader("📊 E/Q sliding-window table")
+    fig, ax = plt.subplots(figsize=(12, 4.8))
+    ax.plot(profile_df["protein_order"], profile_df[aa_selected], marker="o", linewidth=1.4)
+    ax.axhline(y=threshold, linestyle="--", linewidth=1.2)
 
-        eq_window_df = make_eq_window_table(
-            df_sorted=df_for_walk,
-            window=int(window),
-            accession_col="Entry",
-            pos_col="Gene start (bp)",
-        )
+    if enriched.any():
+        ax.scatter(profile_df.loc[enriched, "protein_order"], profile_df.loc[enriched, aa_selected], s=36, zorder=3)
 
-        if eq_window_df.empty:
-            st.warning("Not enough proteins to compute the E/Q sliding-window table.")
+    ax.set_xlabel("Proteins ordered along the chromosome")
+    ax.set_ylabel(f"Absolute content of {aa_selected}")
+    ax.set_title(f"{aa_selected} content profile with threshold T={threshold}")
+    ax.grid(True, axis="y")
+    return fig
+
+
+def build_eq_comparison_plot(eq_df: pd.DataFrame):
+    if eq_df.empty:
+        return None
+
+    fig, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(eq_df["frame_number"], eq_df["E_count"], marker="o", linewidth=1.8, label="E")
+    ax1.plot(eq_df["frame_number"], eq_df["Q_count"], marker="s", linewidth=1.8, label="Q")
+    ax1.set_xlabel("Frame number")
+    ax1.set_ylabel("Number of proteins with X > T")
+    ax1.grid(True, axis="y")
+
+    ax2 = ax1.twinx()
+    ax2.plot(eq_df["frame_number"], eq_df["E_Q_ratio"], marker="^", linewidth=1.5, linestyle="--", label="E/Q")
+    ax2.set_ylabel("E/Q ratio")
+
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+    ax1.set_title("Walking comparison: E, Q and E/Q ratio")
+    return fig
+
+
+def run_analysis(chromosome_number: str):
+    df_ensembl = fetch_ensembl_data(chromosome_number)
+    df_uniprot, raw_uniprot = fetch_uniprot_data(chromosome_number)
+    merged_df = merge_ensembl_uniprot(df_ensembl, df_uniprot)
+    aa_df = compute_amino_acid_counts(merged_df)
+    canonical_df = build_canonical_table(merged_df, aa_df)
+    return df_ensembl, canonical_df, raw_uniprot
+
+
+def main():
+    init_session_state()
+
+    st.title("Chromosome Protein Analyzer")
+    st.write(
+        "Canonical table, downloadable WALKING tables, Figure B-style plot, "
+        "Figure A-style schematic panel with all iterations, E/Q/EQ comparison, "
+        "AA content profile with T line and normalized walking heatmap."
+    )
+
+    with st.sidebar:
+        st.header("Parameters")
+        chromosome_number = st.text_input("Chromosome number", value="1")
+        aa_selected = st.selectbox("Amino acid", AA_COLUMNS, index=3)
+        window_size = st.number_input("Window size (LB)", min_value=2, max_value=500, value=25, step=1)
+        threshold = st.number_input("Threshold (T)", min_value=0, max_value=10000, value=49, step=1)
+        run_button = st.button("Run analysis", use_container_width=True)
+
+    validated_chromosome = validate_chromosome(chromosome_number)
+
+    params = {
+        "chromosome_number": validated_chromosome,
+        "aa_selected": aa_selected,
+        "window_size": int(window_size),
+        "threshold": int(threshold),
+    }
+
+    if run_button:
+        if not params["chromosome_number"]:
+            st.error("Invalid chromosome. Please enter one of: 1-22, X, Y or MT. Inputs such as chr1 or chrX are accepted.")
+            st.session_state.analysis_done = False
+            return
+
+        with st.spinner("Retrieving data from Ensembl and UniProt..."):
+            try:
+                df_ensembl, canonical_df, raw_uniprot = run_analysis(params["chromosome_number"])
+            except Exception as e:
+                st.error(f"Error during analysis: {e}")
+                st.session_state.analysis_done = False
+                return
+
+        st.session_state.df_ensembl = df_ensembl
+        st.session_state.canonical_df = canonical_df
+        st.session_state.raw_uniprot = raw_uniprot
+        st.session_state.analysis_done = True
+        st.session_state.show_heatmap = False
+        st.session_state.last_params = params.copy()
+
+    if not st.session_state.analysis_done:
+        st.info("Set the parameters in the sidebar and run the analysis.")
+        return
+
+    canonical_df = st.session_state.canonical_df
+    df_ensembl = st.session_state.df_ensembl
+    raw_uniprot = st.session_state.raw_uniprot
+    stored_params = st.session_state.last_params or params
+
+    if canonical_df is None or canonical_df.empty:
+        st.warning("No data available after merging Ensembl and UniProt.")
+        return
+
+    st.subheader(f"Results for chromosome {stored_params['chromosome_number']}")
+
+    walking_df = build_walking_table(
+        canonical_df=canonical_df,
+        aa_selected=stored_params["aa_selected"],
+        window_size=stored_params["window_size"],
+        threshold=stored_params["threshold"],
+    )
+
+    eq_df = build_eq_ratio_table(
+        canonical_df=canonical_df,
+        window_size=stored_params["window_size"],
+        threshold=stored_params["threshold"],
+    )
+
+    profile_preview = canonical_df[
+        ["Gene name", "Gene stable ID", "Gene start (bp)", "Gene end (bp)", stored_params["aa_selected"]]
+    ].copy()
+    profile_preview["above_threshold"] = profile_preview[stored_params["aa_selected"]] > stored_params["threshold"]
+    profile_preview.insert(0, "protein_order", np.arange(1, len(profile_preview) + 1))
+
+    source_export = df_ensembl.copy() if df_ensembl is not None else pd.DataFrame()
+
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Canonical table",
+        "Walking and plots",
+        "AA profile",
+        "Source data",
+    ])
+
+    with tab1:
+        st.dataframe(canonical_df, use_container_width=True)
+        st.write(f"Number of rows: {len(canonical_df)}")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("Download canonical table CSV",
+                data=dataframe_to_csv_bytes(canonical_df),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_canonical.csv",
+                mime="text/csv")
+        with c2:
+            st.download_button("Download canonical table Excel",
+                data=dataframe_to_xlsx_bytes(canonical_df, sheet_name="canonical"),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_canonical.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    with tab2:
+        if walking_df.empty:
+            st.warning("Insufficient data for walking with the selected parameters.")
         else:
-            st.session_state["eq_window_df"] = eq_window_df
-
-            st.caption(f"E/Q window table rows: {len(eq_window_df)} (computed as N - window + 1)")
-            st.dataframe(eq_window_df.head(50), width="stretch")
-            st.caption("Showing first 50 rows only. Download the full E/Q window table below.")
-
-            eq_csv_bytes = eq_window_df.to_csv(index=False).encode("utf-8")
-            st.download_button(
-                label="⬇️ Download full E/Q window table (CSV)",
-                data=eq_csv_bytes,
-                file_name=f"chromosome_{chrom_ok}_EQ_window_w{int(window)}.csv",
-                mime="text/csv",
+            st.write(
+                f"Walking on AA = {stored_params['aa_selected']}, "
+                f"LB = {stored_params['window_size']}, T = {stored_params['threshold']}"
             )
+            fig_a = build_figure_a(canonical_df, stored_params["aa_selected"], stored_params["threshold"], stored_params["window_size"])
+            if fig_a is not None:
+                st.pyplot(fig_a)
+            st.pyplot(build_figure_b(walking_df))
+            fig_eq = build_eq_comparison_plot(eq_df)
+            if fig_eq is not None:
+                st.pyplot(fig_eq)
 
-            st.subheader("📈 E/Q sliding-window plot (chromosome overview)")
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download WALKING table CSV",
+                    data=dataframe_to_csv_bytes(walking_df),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_canonical_WALKING.csv",
+                    mime="text/csv")
+            with c2:
+                st.download_button("Download WALKING table Excel",
+                    data=dataframe_to_xlsx_bytes(walking_df, sheet_name="walking"),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_canonical_WALKING.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            eq_plot_df = eq_window_df.copy()
-            eq_x_col = "Frame start bp" if x_axis_choice == "Frame start bp" else "Frame #"
+            if not eq_df.empty:
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.download_button("Download E_Q table CSV",
+                        data=dataframe_to_csv_bytes(eq_df),
+                        file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_EQ_ratio.csv",
+                        mime="text/csv")
+                with c4:
+                    st.download_button("Download E_Q table Excel",
+                        data=dataframe_to_xlsx_bytes(eq_df, sheet_name="EQ_ratio"),
+                        file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_EQ_ratio.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            if smooth and smooth_window > 1:
-                eq_plot_df["Mean E/Q smoothed"] = eq_plot_df["Mean E/Q ratio"].rolling(
-                    window=int(smooth_window),
-                    min_periods=1
-                ).mean()
-                y_col = "Mean E/Q smoothed"
-            else:
-                y_col = "Mean E/Q ratio"
+            with st.expander("WALKING table preview"):
+                st.dataframe(walking_df, use_container_width=True)
+            if not eq_df.empty:
+                with st.expander("E/Q table preview"):
+                    st.dataframe(eq_df, use_container_width=True)
 
-            fig_eq_window, axeq = plt.subplots(figsize=(12, 5))
-            axeq.plot(eq_plot_df[eq_x_col], eq_plot_df[y_col])
-            axeq.set_title(f"E/Q sliding-window mean along chromosome {chrom_ok}")
-            axeq.set_xlabel(eq_x_col)
-            axeq.set_ylabel("Mean E/Q ratio")
-            st.pyplot(fig_eq_window)
+            st.markdown("---")
+            if st.button("Generate normalized walking heatmap", key="generate_heatmap"):
+                st.session_state.show_heatmap = True
+            if st.session_state.show_heatmap:
+                fig_heatmap = build_walking_heatmap(canonical_df, stored_params["window_size"], stored_params["threshold"])
+                if fig_heatmap is None:
+                    st.warning("Unable to generate the heatmap with the selected parameters.")
+                else:
+                    st.pyplot(fig_heatmap)
 
-            st.session_state["fig_eq_window"] = fig_eq_window
+    with tab3:
+        st.pyplot(build_aa_profile_plot(canonical_df, stored_params["aa_selected"], stored_params["threshold"]))
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("Download AA profile CSV",
+                data=dataframe_to_csv_bytes(profile_preview),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.csv",
+                mime="text/csv")
+        with c2:
+            st.download_button("Download AA profile Excel",
+                data=dataframe_to_xlsx_bytes(profile_preview, sheet_name="AA_profile"),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        with st.expander("Profile data preview"):
+            st.dataframe(profile_preview, use_container_width=True)
 
-        st.success("✅ Step 2 (walking) completed.")
-
-
-# =========================================================
-# STEP 3 — E/Q last
-# =========================================================
-if st.session_state["df_protein_raw"] is not None:
-    st.header("Step 3 — E/Q analysis (last step)")
-
-    batch_size = st.slider("Batch size (speed vs responsiveness)", 200, 3000, 1200, 100)
-    run_step3 = st.button("3) Generate E/Q analysis")
-
-    if run_step3:
-        chrom_ok = st.session_state["chrom_ok"]
-        df_prot_raw = st.session_state["df_protein_raw"].copy()
-
-        with st.spinner("Computing full AA counts + E/Q ratio (fast)..."):
-            df_all = add_aa_counts_and_eq_fast(df_prot_raw, batch_size=int(batch_size))
-
-        df_all = df_all.drop(columns=["Sequence"], errors="ignore")
-        st.session_state["df_all"] = df_all
-
-        cols_all = [
-            "Gene stable ID", "Gene name", "Gene start (bp)", "Gene end (bp)",
-            "Entry", "Is_reviewed", "SeqLen", "SeqHash", "Entry_has_multiple_sequences", "Isoform detected",
-            "Length", "E/Q ratio", "E/Q valid",
-        ] + AA_ORDER
-        cols_all = [c for c in cols_all if c in df_all.columns and c != "Chromosome/scaffold name"]
-
-        preview_and_download(
-            df=df_all,
-            preview_cols=cols_all,
-            title="Table — Protein-level AA counts + E/Q (one row per accession)",
-            base_filename=f"chromosome_{chrom_ok}_EQ_full",
-            preview_default=10,
-        )
-
-        invalid_mask = ~df_all["E/Q valid"]
-        n_invalid = int(invalid_mask.sum())
-        n_total = int(len(df_all))
-        n_valid = n_total - n_invalid
-
-        st.subheader("✅/❌ E/Q usability")
-        st.write(f"Total proteins: **{n_total}**")
-        st.write(f"Proteins with **non-usable** E/Q (Q = 0): **{n_invalid}**")
-        st.write(f"Proteins with **valid** E/Q: **{n_valid}**")
-
-        st.subheader("📈 Average amino acid composition (all proteins)")
-        avg_comp_all = df_all[AA_ORDER].mean(numeric_only=True)
-        st.session_state["avg_comp_all"] = avg_comp_all
-        st.bar_chart(avg_comp_all)
-
-        st.subheader("📋 E/Q ratio summary statistics (valid E/Q only)")
-        df_valid = df_all[df_all["E/Q valid"]].copy().reset_index(drop=True)
-        st.session_state["df_valid"] = df_valid
-
-        if df_valid.empty:
-            st.error("No proteins with valid E/Q on this chromosome.")
-            st.stop()
-
-        eq_summary = {
-            "Mean": df_valid["E/Q ratio"].mean(),
-            "Median": df_valid["E/Q ratio"].median(),
-            "Standard deviation": df_valid["E/Q ratio"].std(),
-            "Minimum": df_valid["E/Q ratio"].min(),
-            "Maximum": df_valid["E/Q ratio"].max(),
-            "Count (valid EQ)": len(df_valid),
-            "Total proteins": n_total,
-            "Invalid EQ (Q=0)": n_invalid,
-        }
-        eq_summary_df = pd.DataFrame(eq_summary, index=["Value"]).T
-        st.session_state["eq_summary_df"] = eq_summary_df
-        st.table(eq_summary_df)
-
-        st.subheader("🔗 Correlation between protein length and E/Q ratio (valid proteins)")
-        corr_df = df_valid.dropna(subset=["Length", "E/Q ratio"])
-        fig_corr = None
-        if len(corr_df) > 2:
-            r, p = pearsonr(corr_df["Length"], df_valid.loc[corr_df.index, "E/Q ratio"])
-            st.write(f"**Pearson r** = `{r:.3f}` (p = `{p:.3e}`)")
-            fig_corr, ax = plt.subplots(figsize=(8, 5))
-            sns.regplot(data=corr_df, x="Length", y="E/Q ratio", scatter_kws={"alpha": 0.6})
-            ax.set_title(f"Length vs E/Q (r={r:.2f})")
-            st.pyplot(fig_corr)
+    with tab4:
+        st.write("### Ensembl data")
+        if df_ensembl is None or df_ensembl.empty:
+            st.warning("No Ensembl data found.")
         else:
-            st.warning("Not enough valid data points to compute correlation.")
-        st.session_state["fig_corr"] = fig_corr
+            st.dataframe(df_ensembl, use_container_width=True)
 
-        st.subheader("📊 E/Q ratio distribution (valid proteins)")
-        fig_hist, axh = plt.subplots(figsize=(10, 5))
-        sns.histplot(df_valid["E/Q ratio"], bins=30, kde=True, ax=axh)
-        axh.set_title(f"E/Q ratio distribution (Chromosome {chrom_ok})")
-        axh.set_xlabel("E/Q ratio")
-        axh.set_ylabel("Protein count")
-        st.pyplot(fig_hist)
-        st.session_state["fig_hist"] = fig_hist
+        st.write("### UniProt output")
+        if raw_uniprot and raw_uniprot.strip():
+            st.text(raw_uniprot)
+        else:
+            st.warning("No UniProt output available.")
 
-        st.success("✅ Step 3 (E/Q) completed.")
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button("Download source data CSV",
+                data=dataframe_to_csv_bytes(source_export),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.csv",
+                mime="text/csv")
+        with c2:
+            st.download_button("Download source data Excel",
+                data=dataframe_to_xlsx_bytes(source_export, sheet_name="ensembl_source"),
+                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-# =========================================================
-# FINAL Excel export
-# =========================================================
-if (
-    st.session_state["df_all"] is not None
-    and st.session_state["df_valid"] is not None
-    and st.session_state["avg_comp_all"] is not None
-    and st.session_state["eq_summary_df"] is not None
-):
-    st.header("Final export")
-
-    if st.button("Generate final Excel file (All + Valid EQ + AverageAA + Stats + Walking + Plots)"):
-        with st.spinner("Creating Excel file..."):
-            excel_bytes = to_excel_bytes(
-                df_all=st.session_state["df_all"],
-                df_valid=st.session_state["df_valid"],
-                avg_comp_all=st.session_state["avg_comp_all"],
-                eq_summary_df=st.session_state["eq_summary_df"],
-                walk_df=st.session_state.get("walk_df"),
-                eq_window_df=st.session_state.get("eq_window_df"),
-                fig_hist=st.session_state.get("fig_hist"),
-                fig_corr=st.session_state.get("fig_corr"),
-                fig_walk=st.session_state.get("fig_walk"),
-                fig_eq_window=st.session_state.get("fig_eq_window"),
-            )
-
-        st.download_button(
-            label="⬇️ Download Excel",
-            data=excel_bytes,
-            file_name=f"chromosome_{st.session_state['chrom_ok']}_final.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+if __name__ == "__main__":
+    main()
