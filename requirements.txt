@@ -2,10 +2,7 @@ streamlit
 pandas
 numpy
 matplotlib
-seaborn
-biopython
-requests
-xlsxwriter
 pybiomart
-scipy
-
+bioservices
+biopython
+openpyxl
