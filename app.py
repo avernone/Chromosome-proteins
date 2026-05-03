@@ -18,6 +18,10 @@ AA_COLUMNS = [
     "M", "N", "P", "Q", "R", "S", "T", "V", "W", "Y"
 ]
 
+# Stable Ensembl archive. Ensembl 115 was released in September 2025.
+# pybiomart expects an HTTP-style BioMart host URL here.
+ENSEMBL_HOST = "http://sep2025.archive.ensembl.org"
+
 
 def init_session_state() -> None:
     defaults = {
@@ -66,7 +70,7 @@ def validate_chromosome(chromosome: str) -> str:
 def fetch_ensembl_data(chromosome_number: str) -> pd.DataFrame:
     dataset = Dataset(
         name="hsapiens_gene_ensembl",
-        host="http://www.ensembl.org",
+        host=ENSEMBL_HOST,
     )
 
     df = dataset.query(
