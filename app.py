@@ -27,9 +27,15 @@ def init_session_state() -> None:
     defaults = {
         "analysis_done": False,
         "show_heatmap": False,
+        "walking_generated": False,
+        "aa_profile_generated": False,
+        "source_generated": False,
         "canonical_df": None,
         "df_ensembl": None,
         "raw_uniprot": "",
+        "walking_df": None,
+        "eq_df": None,
+        "profile_preview": None,
         "last_params": {},
     }
     for key, value in defaults.items():
@@ -66,6 +72,58 @@ def validate_chromosome(chromosome: str) -> str:
     return ""
 
 
+def _first_existing_column(df: pd.DataFrame, candidates: list[str]) -> str | None:
+    """Return the first matching column name, ignoring case and extra spaces."""
+    normalized = {str(col).strip().lower(): col for col in df.columns}
+    for candidate in candidates:
+        match = normalized.get(candidate.strip().lower())
+        if match is not None:
+            return match
+    return None
+
+
+def standardize_ensembl_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize BioMart column names that can differ across Ensembl archives.
+
+    Some chromosomes/archive responses return attribute-style names such as
+    ensembl_gene_id, uniprotswissprot and peptide instead of display names such
+    as Gene stable ID, UniProtKB/Swiss-Prot ID and Peptide. The previous code
+    assumed the display names and could fail with KeyError on chromosomes such
+    as 5.
+    """
+    if df.empty:
+        return df
+
+    df = df.copy()
+    column_candidates = {
+        "Gene stable ID": ["Gene stable ID", "ensembl_gene_id"],
+        "Gene name": ["Gene name", "external_gene_name"],
+        "Gene start (bp)": ["Gene start (bp)", "start_position"],
+        "Gene end (bp)": ["Gene end (bp)", "end_position"],
+        "Chromosome/scaffold name": ["Chromosome/scaffold name", "chromosome_name"],
+        "UniProtKB/Swiss-Prot ID": ["UniProtKB/Swiss-Prot ID", "uniprotswissprot", "UniProtKB/Swiss-Prot ID(s)"],
+        "Peptide": ["Peptide", "peptide"],
+    }
+
+    rename_map = {}
+    for canonical_name, candidates in column_candidates.items():
+        existing = _first_existing_column(df, candidates)
+        if existing is not None and existing != canonical_name:
+            rename_map[existing] = canonical_name
+
+    return df.rename(columns=rename_map)
+
+
+def reset_derived_results() -> None:
+    st.session_state.show_heatmap = False
+    st.session_state.walking_generated = False
+    st.session_state.aa_profile_generated = False
+    st.session_state.source_generated = False
+    st.session_state.walking_df = None
+    st.session_state.eq_df = None
+    st.session_state.profile_preview = None
+
+
 @st.cache_data(show_spinner=False)
 def fetch_ensembl_data(chromosome_number: str) -> pd.DataFrame:
     dataset = Dataset(
@@ -89,13 +147,17 @@ def fetch_ensembl_data(chromosome_number: str) -> pd.DataFrame:
     if df.empty:
         return df
 
-    df = df.copy()
+    df = standardize_ensembl_columns(df)
 
-    if "UniProtKB/Swiss-Prot ID" in df.columns:
-        df["UniProtKB/Swiss-Prot ID"] = df["UniProtKB/Swiss-Prot ID"].replace("", np.nan)
+    required_cols = ["UniProtKB/Swiss-Prot ID", "Peptide"]
+    missing_cols = [col for col in required_cols if col not in df.columns]
+    if missing_cols:
+        # Return an empty but schema-compatible frame instead of raising KeyError.
+        for col in missing_cols:
+            df[col] = np.nan
 
-    if "Peptide" in df.columns:
-        df["Peptide"] = df["Peptide"].apply(clean_sequence)
+    df["UniProtKB/Swiss-Prot ID"] = df["UniProtKB/Swiss-Prot ID"].replace("", np.nan)
+    df["Peptide"] = df["Peptide"].apply(clean_sequence)
 
     df = df.dropna(subset=["UniProtKB/Swiss-Prot ID", "Peptide"])
     df = df[df["Peptide"] != ""].copy()
@@ -473,7 +535,7 @@ def main():
         aa_selected = st.selectbox("Amino acid", AA_COLUMNS, index=3)
         window_size = st.number_input("Window size (LB)", min_value=2, max_value=500, value=25, step=1)
         threshold = st.number_input("Threshold (T)", min_value=0, max_value=10000, value=49, step=1)
-        run_button = st.button("Run analysis", use_container_width=True)
+        run_button = st.button("Generate Canonical table", use_container_width=True)
 
     validated_chromosome = validate_chromosome(chromosome_number)
 
@@ -490,7 +552,7 @@ def main():
             st.session_state.analysis_done = False
             return
 
-        with st.spinner("Retrieving data from Ensembl and UniProt..."):
+        with st.spinner("Generating canonical table from Ensembl and UniProt..."):
             try:
                 df_ensembl, canonical_df, raw_uniprot = run_analysis(params["chromosome_number"])
             except Exception as e:
@@ -502,7 +564,7 @@ def main():
         st.session_state.canonical_df = canonical_df
         st.session_state.raw_uniprot = raw_uniprot
         st.session_state.analysis_done = True
-        st.session_state.show_heatmap = False
+        reset_derived_results()
         st.session_state.last_params = params.copy()
 
     if not st.session_state.analysis_done:
@@ -520,25 +582,25 @@ def main():
 
     st.subheader(f"Results for chromosome {stored_params['chromosome_number']}")
 
-    walking_df = build_walking_table(
-        canonical_df=canonical_df,
-        aa_selected=stored_params["aa_selected"],
-        window_size=stored_params["window_size"],
-        threshold=stored_params["threshold"],
+    if params["chromosome_number"] and params["chromosome_number"] != stored_params.get("chromosome_number"):
+        st.warning("The chromosome value changed. Click 'Generate Canonical table' to fetch data for the new chromosome.")
+
+    derived_params_changed = any(
+        params.get(key) != stored_params.get(key)
+        for key in ["aa_selected", "window_size", "threshold"]
     )
+    if derived_params_changed:
+        reset_derived_results()
+        stored_params = {**stored_params, **{
+            "aa_selected": params["aa_selected"],
+            "window_size": params["window_size"],
+            "threshold": params["threshold"],
+        }}
+        st.session_state.last_params = stored_params.copy()
 
-    eq_df = build_eq_ratio_table(
-        canonical_df=canonical_df,
-        window_size=stored_params["window_size"],
-        threshold=stored_params["threshold"],
-    )
-
-    profile_preview = canonical_df[
-        ["Gene name", "Gene stable ID", "Gene start (bp)", "Gene end (bp)", stored_params["aa_selected"]]
-    ].copy()
-    profile_preview["above_threshold"] = profile_preview[stored_params["aa_selected"]] > stored_params["threshold"]
-    profile_preview.insert(0, "protein_order", np.arange(1, len(profile_preview) + 1))
-
+    walking_df = st.session_state.walking_df
+    eq_df = st.session_state.eq_df
+    profile_preview = st.session_state.profile_preview
     source_export = df_ensembl.copy() if df_ensembl is not None else pd.DataFrame()
 
     tab1, tab2, tab3, tab4 = st.tabs([
@@ -549,6 +611,24 @@ def main():
     ])
 
     with tab1:
+        if st.button("Generate / refresh Canonical table", key="btn_canonical_tab", use_container_width=True):
+            if not params["chromosome_number"]:
+                st.error("Invalid chromosome. Please enter one of: 1-22, X, Y or MT. Inputs such as chr1 or chrX are accepted.")
+            else:
+                with st.spinner("Generating canonical table from Ensembl and UniProt..."):
+                    try:
+                        df_ensembl, canonical_df, raw_uniprot = run_analysis(params["chromosome_number"])
+                    except Exception as e:
+                        st.error(f"Error during canonical table generation: {e}")
+                    else:
+                        st.session_state.df_ensembl = df_ensembl
+                        st.session_state.canonical_df = canonical_df
+                        st.session_state.raw_uniprot = raw_uniprot
+                        st.session_state.analysis_done = True
+                        reset_derived_results()
+                        st.session_state.last_params = params.copy()
+                        st.rerun()
+
         st.dataframe(canonical_df, use_container_width=True)
         st.write(f"Number of rows: {len(canonical_df)}")
         c1, c2 = st.columns(2)
@@ -564,7 +644,29 @@ def main():
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
     with tab2:
-        if walking_df.empty:
+        if st.button("Generate Walking and plots", key="btn_walking", use_container_width=True):
+            with st.spinner("Generating walking tables and plots..."):
+                walking_df = build_walking_table(
+                    canonical_df=canonical_df,
+                    aa_selected=stored_params["aa_selected"],
+                    window_size=stored_params["window_size"],
+                    threshold=stored_params["threshold"],
+                )
+                eq_df = build_eq_ratio_table(
+                    canonical_df=canonical_df,
+                    window_size=stored_params["window_size"],
+                    threshold=stored_params["threshold"],
+                )
+                st.session_state.walking_df = walking_df
+                st.session_state.eq_df = eq_df
+                st.session_state.walking_generated = True
+                st.session_state.show_heatmap = False
+
+        walking_df = st.session_state.walking_df
+        eq_df = st.session_state.eq_df
+        if not st.session_state.walking_generated:
+            st.info("Click 'Generate Walking and plots' when you want to compute this section.")
+        elif walking_df is None or walking_df.empty:
             st.warning("Insufficient data for walking with the selected parameters.")
         else:
             st.write(
@@ -575,7 +677,7 @@ def main():
             if fig_a is not None:
                 st.pyplot(fig_a)
             st.pyplot(build_figure_b(walking_df))
-            fig_eq = build_eq_comparison_plot(eq_df)
+            fig_eq = build_eq_comparison_plot(eq_df if eq_df is not None else pd.DataFrame())
             if fig_eq is not None:
                 st.pyplot(fig_eq)
 
@@ -591,7 +693,7 @@ def main():
                     file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_canonical_WALKING.xlsx",
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-            if not eq_df.empty:
+            if eq_df is not None and not eq_df.empty:
                 c3, c4 = st.columns(2)
                 with c3:
                     st.download_button("Download E_Q table CSV",
@@ -606,7 +708,7 @@ def main():
 
             with st.expander("WALKING table preview"):
                 st.dataframe(walking_df, use_container_width=True)
-            if not eq_df.empty:
+            if eq_df is not None and not eq_df.empty:
                 with st.expander("E/Q table preview"):
                     st.dataframe(eq_df, use_container_width=True)
 
@@ -621,45 +723,67 @@ def main():
                     st.pyplot(fig_heatmap)
 
     with tab3:
-        st.pyplot(build_aa_profile_plot(canonical_df, stored_params["aa_selected"], stored_params["threshold"]))
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("Download AA profile CSV",
-                data=dataframe_to_csv_bytes(profile_preview),
-                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.csv",
-                mime="text/csv")
-        with c2:
-            st.download_button("Download AA profile Excel",
-                data=dataframe_to_xlsx_bytes(profile_preview, sheet_name="AA_profile"),
-                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        with st.expander("Profile data preview"):
-            st.dataframe(profile_preview, use_container_width=True)
+        if st.button("Generate AA profile", key="btn_aa_profile", use_container_width=True):
+            with st.spinner("Generating AA profile..."):
+                required_cols = ["Gene name", "Gene stable ID", "Gene start (bp)", "Gene end (bp)", stored_params["aa_selected"]]
+                available_cols = [col for col in required_cols if col in canonical_df.columns]
+                profile_preview = canonical_df[available_cols].copy()
+                profile_preview["above_threshold"] = profile_preview[stored_params["aa_selected"]] > stored_params["threshold"]
+                profile_preview.insert(0, "protein_order", np.arange(1, len(profile_preview) + 1))
+                st.session_state.profile_preview = profile_preview
+                st.session_state.aa_profile_generated = True
+
+        profile_preview = st.session_state.profile_preview
+        if not st.session_state.aa_profile_generated:
+            st.info("Click 'Generate AA profile' when you want to compute this section.")
+        elif profile_preview is None or profile_preview.empty:
+            st.warning("No AA profile data available.")
+        else:
+            st.pyplot(build_aa_profile_plot(canonical_df, stored_params["aa_selected"], stored_params["threshold"]))
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download AA profile CSV",
+                    data=dataframe_to_csv_bytes(profile_preview),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.csv",
+                    mime="text/csv")
+            with c2:
+                st.download_button("Download AA profile Excel",
+                    data=dataframe_to_xlsx_bytes(profile_preview, sheet_name="AA_profile"),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_AA_profile.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            with st.expander("Profile data preview"):
+                st.dataframe(profile_preview, use_container_width=True)
 
     with tab4:
-        st.write("### Ensembl data")
-        if df_ensembl is None or df_ensembl.empty:
-            st.warning("No Ensembl data found.")
-        else:
-            st.dataframe(df_ensembl, use_container_width=True)
+        if st.button("Show / prepare Source data", key="btn_source", use_container_width=True):
+            st.session_state.source_generated = True
 
-        st.write("### UniProt output")
-        if raw_uniprot and raw_uniprot.strip():
-            st.text(raw_uniprot)
+        if not st.session_state.source_generated:
+            st.info("Click 'Show / prepare Source data' when you want to load this section in the interface.")
         else:
-            st.warning("No UniProt output available.")
+            st.write("### Ensembl data")
+            if df_ensembl is None or df_ensembl.empty:
+                st.warning("No Ensembl data found.")
+            else:
+                st.dataframe(df_ensembl, use_container_width=True)
 
-        c1, c2 = st.columns(2)
-        with c1:
-            st.download_button("Download source data CSV",
-                data=dataframe_to_csv_bytes(source_export),
-                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.csv",
-                mime="text/csv")
-        with c2:
-            st.download_button("Download source data Excel",
-                data=dataframe_to_xlsx_bytes(source_export, sheet_name="ensembl_source"),
-                file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+            st.write("### UniProt output")
+            if raw_uniprot and raw_uniprot.strip():
+                st.text(raw_uniprot)
+            else:
+                st.warning("No UniProt output available.")
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.download_button("Download source data CSV",
+                    data=dataframe_to_csv_bytes(source_export),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.csv",
+                    mime="text/csv")
+            with c2:
+                st.download_button("Download source data Excel",
+                    data=dataframe_to_xlsx_bytes(source_export, sheet_name="ensembl_source"),
+                    file_name=f"CHR{stored_params['chromosome_number'].zfill(2)}_ensembl_source.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 if __name__ == "__main__":
