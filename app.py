@@ -20,8 +20,7 @@ AA_COLUMNS = [
 
 # Stable Ensembl archive. Ensembl 115 was released in September 2025.
 # pybiomart expects an HTTP-style BioMart host URL here.
-ENSEMBL_HOST = "http://sep2025.archive.ensembl.org"
-
+ENSEMBL_HOST = "http://may2024.archive.ensembl.org"
 
 def init_session_state() -> None:
     defaults = {
@@ -488,6 +487,88 @@ def build_aa_profile_plot(canonical_df: pd.DataFrame, aa_selected: str, threshol
     return fig
 
 
+
+
+def build_eq_profile_plot(canonical_df: pd.DataFrame):
+    if (
+        canonical_df.empty
+        or "E" not in canonical_df.columns
+        or "Q" not in canonical_df.columns
+        or "length" not in canonical_df.columns
+    ):
+        return None
+
+    profile_df = canonical_df.reset_index(drop=True).copy()
+    profile_df["protein_order"] = np.arange(1, len(profile_df) + 1)
+
+    q_values = profile_df["Q"].replace(0, np.nan)
+
+    profile_df["E_Q_ratio"] = profile_df["E"] / q_values
+    profile_df["E_relative"] = profile_df["E"] / profile_df["length"]
+    profile_df["Q_relative"] = profile_df["Q"] / profile_df["length"]
+
+    fig, ax1 = plt.subplots(figsize=(12, 5))
+
+    # E/Q ratio
+    ax1.plot(
+        profile_df["protein_order"],
+        profile_df["E_Q_ratio"],
+        color="black",
+        marker="o",
+        linewidth=1.8,
+        label="E/Q ratio"
+    )
+
+    ax1.set_xlabel("Proteins ordered along the chromosome")
+    ax1.set_ylabel("E/Q ratio", color="black")
+    ax1.tick_params(axis="y", labelcolor="black")
+
+    # Relative E and Q content
+    ax2 = ax1.twinx()
+
+    ax2.plot(
+        profile_df["protein_order"],
+        profile_df["E_relative"],
+        color="red",
+        marker="s",
+        linewidth=1.5,
+        linestyle="--",
+        label="E/length"
+    )
+
+    ax2.plot(
+        profile_df["protein_order"],
+        profile_df["Q_relative"],
+        color="blue",
+        marker="^",
+        linewidth=1.5,
+        linestyle="--",
+        label="Q/length"
+    )
+
+    ax2.set_ylabel("Relative amino acid content", color="red")
+    ax2.tick_params(axis="y", labelcolor="red")
+
+    # Legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+
+    ax1.legend(
+        lines1 + lines2,
+        labels1 + labels2,
+        loc="upper right"
+    )
+
+    ax1.set_title(
+        "E/Q profile and relative E and Q content along the chromosome"
+    )
+
+    ax1.grid(True, axis="y")
+
+    plt.tight_layout()
+
+    return fig
+
 def build_eq_comparison_plot(eq_df: pd.DataFrame):
     if eq_df.empty:
         return None
@@ -680,6 +761,10 @@ def main():
             fig_eq = build_eq_comparison_plot(eq_df if eq_df is not None else pd.DataFrame())
             if fig_eq is not None:
                 st.pyplot(fig_eq)
+
+            fig_eq_profile = build_eq_profile_plot(canonical_df)
+            if fig_eq_profile is not None:
+                st.pyplot(fig_eq_profile)
 
             c1, c2 = st.columns(2)
             with c1:
